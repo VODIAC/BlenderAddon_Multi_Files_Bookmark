@@ -11,7 +11,7 @@
 bl_info = {
     "name": "Multi Files Bookmark",
     "author": "61+",
-    "version": (0, 6, 6),
+    "version": (0, 6, 7),
     "blender": (5, 0, 0),
     "location": "3D View > Floating Top Tab Bar",
     "description": "Manage blend project as bookmarks in one Blender window",
@@ -1765,13 +1765,15 @@ class MBB_AddonPreferences(bpy.types.AddonPreferences):
         )
 
     def draw_color_group(self, layout, items):
-        grid = layout.grid_flow(row_major=True, columns=3, even_columns=True, align=True)
-        for label, prop_name in items:
-            cell = grid.split(factor=0.4, align=True)
+        row = layout.row(align=True)
+        for index, (label, prop_name) in enumerate(items):
+            cell = row.split(factor=0.36, align=True)
             label_area = cell.row(align=True)
             label_area.label(text=_t(label))
             swatch_area = cell.row(align=True)
             swatch_area.prop(self, prop_name, text="")
+            if index < len(items) - 1:
+                row.separator(factor=1.25)
 
     def draw_cache_and_toggle_pair(self, layout):
         row = layout.row(align=True)
@@ -1816,7 +1818,7 @@ class MBB_AddonPreferences(bpy.types.AddonPreferences):
             control_area = cell.row(align=True)
             control_area.label(text=_t("Restart Blender"))
             return
-        label_area.prop(kmi, "active", text="")
+        label_area.prop(kmi, "active", text="", emboss=False)
         label_area.separator(factor=0.35)
         label_area.label(text=_t(SHORTCUT_TARGET_LABELS[target]))
         control_area = cell.row(align=True)
@@ -1832,20 +1834,42 @@ def _read_overlay_state_file():
         with open(OVERLAY_STATE_PATH, "r", encoding="utf-8") as handle:
             data = json.load(handle)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {"default_state": "NAMES", "area_states": []}
-    area_states = data.get("area_states", [])
-    if not isinstance(area_states, list):
-        area_states = []
+        return {"projects": {}, "legacy_area_states": []}
+    projects = data.get("projects", {})
+    if not isinstance(projects, dict):
+        projects = {}
+    clean_projects = {}
+    for key, value in projects.items():
+        if not isinstance(value, dict):
+            continue
+        area_states = value.get("area_states", [])
+        if not isinstance(area_states, list):
+            area_states = []
+        clean_projects[str(key)] = {
+            "area_states": [_clean_overlay_state(state, "HIDDEN") for state in area_states],
+            "view_mode": _clean_overlay_state(value.get("view_mode", "NAMES")),
+        }
+    legacy_area_states = data.get("area_states", [])
+    if not isinstance(legacy_area_states, list):
+        legacy_area_states = []
     return {
-        "default_state": _clean_overlay_state(data.get("default_state", "NAMES")),
-        "area_states": [_clean_overlay_state(state) for state in area_states],
+        "projects": clean_projects,
+        "legacy_area_states": [_clean_overlay_state(state, "HIDDEN") for state in legacy_area_states],
     }
 
 
 def _write_overlay_state_file(data):
+    projects = data.get("projects", {})
+    if not isinstance(projects, dict):
+        projects = {}
     safe_data = {
-        "default_state": _clean_overlay_state(data.get("default_state", "NAMES")),
-        "area_states": [_clean_overlay_state(state) for state in data.get("area_states", [])],
+        "projects": {
+            str(key): {
+                "area_states": [_clean_overlay_state(state, "HIDDEN") for state in value.get("area_states", [])] if isinstance(value, dict) else [],
+                "view_mode": _clean_overlay_state(value.get("view_mode", "NAMES")) if isinstance(value, dict) else "NAMES",
+            }
+            for key, value in projects.items()
+        },
         "updated_at": _now(),
     }
     try:
@@ -1858,40 +1882,40 @@ def _write_overlay_state_file(data):
         pass
 
 
+def _overlay_project_key(context=None):
+    filepath = _current_blend_filepath()
+    if filepath:
+        return bpy.path.abspath(filepath)
+    return "__UNTITLED__"
+
+
 def _initialize_overlay_state_from_disk(context=None):
     global _overlay_default_state, _overlay_saved_area_states, _overlay_area_states, _overlay_area_previous_modes, _overlay_view_mode_state
     data = _read_overlay_state_file()
-    _overlay_default_state = _clean_overlay_state(data.get("default_state", "NAMES"))
-    _overlay_saved_area_states = [_clean_overlay_state(state) for state in data.get("area_states", [])]
+    project_data = data.get("projects", {}).get(_overlay_project_key(context), {})
+    _overlay_saved_area_states = [_clean_overlay_state(state, "HIDDEN") for state in project_data.get("area_states", [])]
+    _overlay_default_state = "HIDDEN"
     _overlay_area_states.clear()
     _overlay_area_previous_modes.clear()
     for index, area in enumerate(_view3d_areas_sorted(getattr(context or bpy.context, "screen", None))):
         area_id = _area_id(area)
         if not area_id:
             continue
-        state = _overlay_saved_area_states[index] if index < len(_overlay_saved_area_states) else _overlay_default_state
-        _overlay_area_states[area_id] = _clean_overlay_state(state)
+        state = _overlay_saved_area_states[index] if index < len(_overlay_saved_area_states) else "HIDDEN"
+        _overlay_area_states[area_id] = _clean_overlay_state(state, "HIDDEN")
         if _overlay_area_states[area_id] in VISIBLE_OVERLAY_STATES:
             _overlay_area_previous_modes[area_id] = _overlay_area_states[area_id]
-    _overlay_view_mode_state = "THUMBNAILS" if _overlay_default_state == "THUMBNAILS" else "NAMES"
+    view_mode = project_data.get("view_mode", "NAMES") if isinstance(project_data, dict) else "NAMES"
+    _overlay_view_mode_state = "THUMBNAILS" if _clean_overlay_state(view_mode) == "THUMBNAILS" else "NAMES"
 
 
 def _overlay_state_for_area(area=None, area_id=""):
     area = area or getattr(bpy.context, "area", None)
     area_id = area_id or _area_id(area)
     if not area_id:
-        return _overlay_default_state
+        return "HIDDEN"
     if area_id not in _overlay_area_states:
-        state = _overlay_default_state
-        sorted_areas = _view3d_areas_sorted(getattr(bpy.context, "screen", None))
-        for index, candidate in enumerate(sorted_areas):
-            if _area_id(candidate) == area_id:
-                if index < len(_overlay_saved_area_states):
-                    state = _overlay_saved_area_states[index]
-                break
-        _overlay_area_states[area_id] = _clean_overlay_state(state)
-        if _overlay_area_states[area_id] in VISIBLE_OVERLAY_STATES:
-            _overlay_area_previous_modes[area_id] = _overlay_area_states[area_id]
+        _overlay_area_states[area_id] = "HIDDEN"
     return _overlay_area_states[area_id]
 
 
@@ -1909,11 +1933,13 @@ def _persist_overlay_state(context=None):
         if not area_id:
             continue
         area_states.append(_overlay_state_for_area(area, area_id))
-    if area_states:
-        active_area = getattr(context or bpy.context, "area", None)
-        active_state = _overlay_state_for_area(active_area) if active_area and active_area.type == "VIEW_3D" else area_states[0]
-        _overlay_default_state = active_state
-    _write_overlay_state_file({"default_state": _overlay_default_state, "area_states": area_states})
+    data = _read_overlay_state_file()
+    projects = data.get("projects", {})
+    projects[_overlay_project_key(context)] = {
+        "area_states": area_states,
+        "view_mode": _overlay_view_mode_state,
+    }
+    _write_overlay_state_file({"projects": projects})
 
 
 def _set_overlay_area_state(area_id, state, context=None):
@@ -1923,7 +1949,6 @@ def _set_overlay_area_state(area_id, state, context=None):
         _overlay_area_states[area_id] = state
         if state in VISIBLE_OVERLAY_STATES:
             _overlay_area_previous_modes[area_id] = state
-    _overlay_default_state = state
     _overlay_view_mode_state = "THUMBNAILS" if state == "THUMBNAILS" else "NAMES"
     _persist_overlay_state(context)
 
