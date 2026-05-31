@@ -1,23 +1,20 @@
+div align="center">
+
+<br>
+
 # ✨ Multi Files Bookmark
 
 A lightweight Blender add-on that lets you switch between multiple `.blend` project files in one Blender window, with a clean tab-style dock inspired by Chrome.
 
 <p>
-  <a href="https://extensions.blender.org/add-ons/multi-files-bookmark/">
-    <img src="https://img.shields.io/badge/Get%20it%20on-Blender%20Extensions-F5792A?style=for-the-badge&logo=blender&logoColor=white" alt="Get it on Blender Extensions">
-  </a>
-  <a href="https://github.com/VODIAC/BlenderAddon_Multi_Files_Bookmark">
-    <img src="https://img.shields.io/badge/View%20on-GitHub-181717?style=for-the-badge&logo=github&logoColor=white" alt="View on GitHub">
-  </a>
-  <a href="https://github.com/VODIAC/BlenderAddon_Multi_Files_Bookmark/releases">
-    <img src="https://img.shields.io/badge/Download-Release-4C8EDA?style=for-the-badge&logo=github&logoColor=white" alt="Download Release">
-  </a>
-  <a href="https://space.bilibili.com/3846664">
-    <img src="https://img.shields.io/badge/Follow%20me-Bilibili-00A1D6?style=for-the-badge&logo=bilibili&logoColor=white" alt="Follow me on Bilibili">
-  </a>
+  <a href="https://extensions.blender.org/add-ons/multi-files-bookmark/"><img src="https://img.shields.io/badge/Get%20it%20on-Blender%20Extensions-F5792A?style=for-the-badge&logo=blender&logoColor=white" alt="Get it on Blender Extensions"></a>&nbsp;&nbsp;
+  <a href="https://github.com/VODIAC/BlenderAddon_Multi_Files_Bookmark/releases"><img src="https://img.shields.io/badge/Download-Release-4C8EDA?style=for-the-badge&logo=github&logoColor=white" alt="Download Release"></a>&nbsp;&nbsp;
+  <a href="https://space.bilibili.com/3846664"><img src="https://img.shields.io/badge/Follow%20me-Bilibili-00A1D6?style=for-the-badge&logo=bilibili&logoColor=white" alt="Follow me on Bilibili"></a>&nbsp;&nbsp;
 </p>
 
 ---
+
+</div>
 
 ## 🧭 What it does
 
@@ -38,17 +35,21 @@ A lightweight Blender add-on that lets you switch between multiple `.blend` proj
 
 ## 🎬 Demo
 
-<video src="https://github.com/VODIAC/BlenderAddon_Multi_Files_Bookmark/raw/main/demo/demo.mp4" controls width="100%"></video>
-
-[Open demo video](https://github.com/VODIAC/BlenderAddon_Multi_Files_Bookmark/raw/main/demo/demo.mp4)
+[<video src="https://github.com/VODIAC/BlenderAddon_Multi_Files_Bookmark/raw/main/demo/demo.mp4" controls width="100%">](https://github.com/user-attachments/assets/bc5ffdd9-738e-4e92-8a25-317801ecf014)</video>
 
 ---
 
 ## 🖼️ Preview
 
+## - Main interface screenshot
+
 ![Main interface](https://raw.githubusercontent.com/VODIAC/BlenderAddon_Multi_Files_Bookmark/main/demo/%E4%B8%BB%E7%95%8C%E9%9D%A2%E6%95%88%E6%9E%9C%E5%9B%BE.jpg)
 
+## - Dock bar status toggle
+
 ![Main interface 2](https://raw.githubusercontent.com/VODIAC/BlenderAddon_Multi_Files_Bookmark/main/demo/%E4%B8%BB%E7%95%8C%E9%9D%A2%E6%95%88%E6%9E%9C%E5%9B%BE2.jpg)
+
+## - Settings for shortcut keys, color, size, and position
 
 ![Shortcuts and settings](https://raw.githubusercontent.com/VODIAC/BlenderAddon_Multi_Files_Bookmark/main/demo/%E5%BF%AB%E6%8D%B7%E9%94%AE%E5%92%8C%E8%AE%BE%E7%BD%AE.jpg)
 
@@ -75,8 +76,8 @@ A lightweight Blender add-on that lets you switch between multiple `.blend` proj
 ## 🌀 Basic Workflow
 
 1. Enable **Multi Files Bookmark** in Blender.
-2. Add your frequently used `.blend` projects to the dock.
-3. Use the tab-style bar to switch files quickly.
+2. Add new `.blend` projects to the dock or create new file.
+3. Use the tab bar to switch files quickly without saving.
 4. Customize the dock appearance and shortcut behavior in the add-on settings.
 
 ---
@@ -85,18 +86,14 @@ A lightweight Blender add-on that lets you switch between multiple `.blend` proj
 
 **Blender 5.0 and newer**
 
-For the latest version and compatibility information, visit the official extension page:
-
-[Multi Files Bookmark on Blender Extensions](https://extensions.blender.org/add-ons/multi-files-bookmark/)
-
 ---
 
 ## 👤 Author
 
-Created by **Vodiac**.
+Created by **61+**.
 
 - Blender Extensions: [Multi Files Bookmark](https://extensions.blender.org/add-ons/multi-files-bookmark/)
-- GitHub: [VODIAC/BlenderAddon_Multi_Files_Bookmark](https://github.com/VODIAC/BlenderAddon_Multi_Files_Bookmark)
+- GitHub: [BlenderAddon_Multi_Files_Bookmark](https://github.com/VODIAC/BlenderAddon_Multi_Files_Bookmark)
 - Bilibili: [space.bilibili.com/3846664](https://space.bilibili.com/3846664)
 
 Feedback, issue reports, and suggestions are welcome.
