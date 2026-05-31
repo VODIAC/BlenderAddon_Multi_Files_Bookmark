@@ -11,7 +11,7 @@
 bl_info = {
     "name": "Multi Files Bookmark",
     "author": "61+",
-    "version": (0, 6, 7),
+    "version": (0, 6, 8),
     "blender": (5, 0, 0),
     "location": "3D View > Floating Top Tab Bar",
     "description": "Manage blend project as bookmarks in one Blender window",
@@ -49,7 +49,7 @@ OVERLAY_STATE_PATH = os.path.join(DEFAULT_CACHE_DIR, "multi_blender_bookmark_ove
 
 MAX_BOOKMARK_LABEL_CHARS = 12
 OVERLAY_MARGIN = 14
-OVERLAY_TOP_OFFSET = 60
+OVERLAY_TOP_OFFSET = 61
 TAB_WIDTH = 190
 TAB_HEIGHT = 40
 THUMB_TAB_WIDTH = 204
@@ -64,6 +64,7 @@ VIEW_TOGGLE_WIDTH = 88
 CONTROL_GAP = 10
 TAB_GROUP_GAP = 12
 DOCK_PADDING_Y = 7
+DOCK_ICON_BASE_SCALE = 1.2
 
 # Icon proportions are based on Microsoft Fluent UI System Icons (MIT):
 # https://github.com/microsoft/fluentui-system-icons
@@ -74,6 +75,7 @@ ICON_REFERENCE = "Microsoft Fluent UI System Icons"
 
 ADD_BUTTON_BLUE = (0.033104766570885055, 0.14126329114027164, 0.7758222183174236, 1.0)  # sRGB #3369e4
 ADD_BUTTON_BLUE_HOVER = (0.07323895587840543, 0.2232279573168085, 1.0, 1.0)  # sRGB #4c82ff
+PLUS_BUTTON_COLOR = (1.0, 1.0, 1.0, 1.0)
 DOCK_INNER_COLOR = (0.84, 0.845, 0.84, 0.98)
 DOCK_TAB_COLOR = (1.0, 1.0, 1.0, 0.985)
 DOCK_SELECTED_COLOR = (0.76, 0.84, 1.0, 0.92)
@@ -107,6 +109,7 @@ SHORTCUT_DEFAULTS = {
     "shortcut_next": "CTRL TAB",
     "shortcut_prev": "CTRL SHIFT TAB",
     "shortcut_toggle_bar": "CTRL SHIFT ACCENT_GRAVE",
+    "shortcut_save_origin": "ALT OSKEY S",
 }
 
 SHORTCUT_TARGETS = (
@@ -121,9 +124,11 @@ SHORTCUT_TARGET_LABELS = {
     "shortcut_next": "Switch to Next",
     "shortcut_prev": "Switch to Previous",
     "shortcut_toggle_bar": "Toggle Bar",
+    "shortcut_save_origin": "Save to Origin",
 }
 DOCK_SHORTCUT_OPERATOR_ID = "wm.mbb_dock_shortcut"
 TOGGLE_BAR_SHORTCUT_OPERATOR_ID = "wm.mbb_toggle_area_tab_bar"
+SAVE_ORIGINAL_OPERATOR_ID = "wm.mbb_save_original_project"
 KEYMAP_NAME = "Window"
 KEYMAP_SPACE_TYPE = "EMPTY"
 INTRO_TEXT = "Dock bar sits atop the 3D View and toggles via the bookmark icon or Toggle Bar shortcut."
@@ -275,6 +280,10 @@ def _keymap_item_for_target(target, keyconfig=None):
         for kmi in km.keymap_items:
             if target == "shortcut_toggle_bar":
                 if kmi.idname == TOGGLE_BAR_SHORTCUT_OPERATOR_ID:
+                    return kc, km, kmi
+                continue
+            if target == "shortcut_save_origin":
+                if kmi.idname == SAVE_ORIGINAL_OPERATOR_ID:
                     return kc, km, kmi
                 continue
             if kmi.idname != DOCK_SHORTCUT_OPERATOR_ID:
@@ -663,12 +672,31 @@ def _force_edge_background_to_thumbnail_white(pixels, width, height):
 
 def _tag_view3d_redraw(context=None):
     context = context or bpy.context
-    screen = getattr(context, "screen", None)
-    if not screen:
-        return
-    for area in screen.areas:
-        if area.type == "VIEW_3D":
-            area.tag_redraw()
+    windows = getattr(getattr(context, "window_manager", None), "windows", None)
+    screens = []
+    if windows:
+        screens.extend(getattr(window, "screen", None) for window in windows)
+    screens.append(getattr(context, "screen", None))
+    seen = set()
+    for screen in screens:
+        if not screen or screen.as_pointer() in seen:
+            continue
+        seen.add(screen.as_pointer())
+        for area in screen.areas:
+            if area.type == "VIEW_3D":
+                area.tag_redraw()
+
+
+def _redraw_dock_preferences(_self=None, context=None):
+    _request_view3d_redraw(context)
+
+
+def _request_view3d_redraw(context=None):
+    _tag_view3d_redraw(context)
+    try:
+        bpy.app.timers.register(lambda: (_tag_view3d_redraw(), None)[1], first_interval=0.01)
+    except Exception:
+        pass
 
 
 def _refresh_view_before_thumbnail(context=None):
@@ -1391,6 +1419,31 @@ def _find_tab_by_any_path(filepath):
     return None
 
 
+def _is_cache_file_path(filepath):
+    filepath = bpy.path.abspath(filepath) if filepath else ""
+    if not filepath:
+        return False
+    try:
+        return os.path.commonpath([filepath, bpy.path.abspath(_cache_dir())]) == bpy.path.abspath(_cache_dir())
+    except (OSError, ValueError):
+        return False
+
+
+def _manual_save_target_from_tab(tab, current=""):
+    if not tab:
+        return ""
+    original = bpy.path.abspath(tab.get("filepath", "")) if tab.get("filepath", "") else ""
+    cache_path = bpy.path.abspath(tab.get("cache_filepath", "")) if tab.get("cache_filepath", "") else ""
+    current = bpy.path.abspath(current) if current else ""
+    if not original:
+        return ""
+    if cache_path and bpy.path.abspath(original) == cache_path:
+        return ""
+    if _is_untitled_path(original) or _is_cache_file_path(original):
+        return ""
+    return original
+
+
 def _active_registry_tab():
     for tab in _clean_registry(_read_registry())["tabs"]:
         if bool(tab.get("is_active", False)):
@@ -1643,7 +1696,7 @@ class MBB_AddonPreferences(bpy.types.AddonPreferences):
         description="Distance between the top of the 3D View and the bookmark dock",
         default=OVERLAY_TOP_OFFSET,
         min=0,
-        max=120,
+        max=600,
     )
     dock_ui_scale: FloatProperty(
         name="Dock UI Scale",
@@ -1654,13 +1707,14 @@ class MBB_AddonPreferences(bpy.types.AddonPreferences):
         precision=2,
     )
     dock_inner_color: FloatVectorProperty(
-        name="Inner",
+        name="Panel",
         description="Background color of the dock shell",
         subtype="COLOR",
         size=4,
         min=0.0,
         max=1.0,
         default=DOCK_INNER_COLOR,
+        update=_redraw_dock_preferences,
     )
     dock_tab_color: FloatVectorProperty(
         name="Tab Color",
@@ -1670,6 +1724,7 @@ class MBB_AddonPreferences(bpy.types.AddonPreferences):
         min=0.0,
         max=1.0,
         default=DOCK_TAB_COLOR,
+        update=_redraw_dock_preferences,
     )
     dock_selected_color: FloatVectorProperty(
         name="Selected",
@@ -1679,6 +1734,7 @@ class MBB_AddonPreferences(bpy.types.AddonPreferences):
         min=0.0,
         max=1.0,
         default=DOCK_SELECTED_COLOR,
+        update=_redraw_dock_preferences,
     )
     dock_button_color: FloatVectorProperty(
         name="Button",
@@ -1688,6 +1744,17 @@ class MBB_AddonPreferences(bpy.types.AddonPreferences):
         min=0.0,
         max=1.0,
         default=ADD_BUTTON_BLUE,
+        update=_redraw_dock_preferences,
+    )
+    dock_plus_button_color: FloatVectorProperty(
+        name="Plus button",
+        description="Color of the plus icon inside the add button",
+        subtype="COLOR",
+        size=4,
+        min=0.0,
+        max=1.0,
+        default=PLUS_BUTTON_COLOR,
+        update=_redraw_dock_preferences,
     )
     dock_outline_color: FloatVectorProperty(
         name="Outline",
@@ -1697,6 +1764,7 @@ class MBB_AddonPreferences(bpy.types.AddonPreferences):
         min=0.0,
         max=1.0,
         default=DOCK_OUTLINE_COLOR,
+        update=_redraw_dock_preferences,
     )
     dock_text_color: FloatVectorProperty(
         name="Text",
@@ -1706,6 +1774,7 @@ class MBB_AddonPreferences(bpy.types.AddonPreferences):
         min=0.0,
         max=1.0,
         default=DOCK_TEXT_COLOR,
+        update=_redraw_dock_preferences,
     )
     cache_directory: StringProperty(
         name="Cache Folder",
@@ -1719,8 +1788,8 @@ class MBB_AddonPreferences(bpy.types.AddonPreferences):
         intro = layout.column(align=True)
         intro.label(text=_t(INTRO_TEXT))
         self.draw_control_pair(layout)
-        self.draw_color_pair(layout)
-        self.draw_cache_and_toggle_pair(layout)
+        self.draw_color_and_cache_pair(layout)
+        self.draw_save_and_toggle_pair(layout)
         targets = list(SHORTCUT_TARGETS)
         for offset in range(0, len(targets), 2):
             self.draw_shortcut_pair(layout, targets[offset], targets[offset + 1] if offset + 1 < len(targets) else "")
@@ -1742,43 +1811,27 @@ class MBB_AddonPreferences(bpy.types.AddonPreferences):
         control_area = cell.row(align=True)
         control_area.prop(self, prop_name, text="", slider=True)
 
-    def draw_color_pair(self, layout):
+    def draw_color_and_cache_pair(self, layout):
         row = layout.row(align=True)
         left_col = row.column(align=True)
-        self.draw_color_group(
-            left_col,
-            (
-                ("Inner", "dock_inner_color"),
-                ("Selected", "dock_selected_color"),
-                ("Tab", "dock_tab_color"),
-            ),
-        )
+        self.draw_color_menu_cell(left_col)
         row.separator(factor=1.6)
         right_col = row.column(align=True)
-        self.draw_color_group(
-            right_col,
-            (
-                ("Button", "dock_button_color"),
-                ("Outline", "dock_outline_color"),
-                ("Text", "dock_text_color"),
-            ),
-        )
+        self.draw_cache_cell(right_col)
 
-    def draw_color_group(self, layout, items):
-        row = layout.row(align=True)
-        for index, (label, prop_name) in enumerate(items):
-            cell = row.split(factor=0.36, align=True)
-            label_area = cell.row(align=True)
-            label_area.label(text=_t(label))
-            swatch_area = cell.row(align=True)
-            swatch_area.prop(self, prop_name, text="")
-            if index < len(items) - 1:
-                row.separator(factor=1.25)
+    def draw_color_menu_cell(self, layout):
+        cell = layout.split(factor=0.48, align=True)
+        label_area = cell.row(align=True)
+        label_area.label(text="", icon="COLOR")
+        label_area.separator(factor=0.35)
+        label_area.label(text=_t("Change UI Color"))
+        control_area = cell.row(align=True)
+        control_area.operator(MBB_OT_change_ui_color_menu.bl_idname, text=_t("Open List"), icon="DOWNARROW_HLT")
 
-    def draw_cache_and_toggle_pair(self, layout):
+    def draw_save_and_toggle_pair(self, layout):
         row = layout.row(align=True)
         left_col = row.column(align=True)
-        self.draw_cache_cell(left_col)
+        self.draw_shortcut_row(left_col, "shortcut_save_origin")
         row.separator(factor=1.6)
         right_col = row.column(align=True)
         self.draw_toggle_shortcut_cell(right_col)
@@ -1975,7 +2028,7 @@ def _addon_preferences():
 def _dock_top_offset():
     prefs = _addon_preferences()
     if prefs and hasattr(prefs, "dock_top_offset"):
-        return max(0, min(120, int(prefs.dock_top_offset)))
+        return max(0, min(600, int(prefs.dock_top_offset)))
     return OVERLAY_TOP_OFFSET
 
 
@@ -1984,6 +2037,10 @@ def _dock_ui_scale():
     if prefs and hasattr(prefs, "dock_ui_scale"):
         return max(0.1, min(1.5, float(prefs.dock_ui_scale)))
     return 1.0
+
+
+def _dock_icon_stroke_scale():
+    return _dock_ui_scale() / DOCK_ICON_BASE_SCALE
 
 
 def _clamp_color(color, fallback):
@@ -2014,6 +2071,10 @@ def _dock_selected_color():
 
 def _dock_button_color():
     return _dock_color("dock_button_color", ADD_BUTTON_BLUE)
+
+
+def _dock_plus_button_color():
+    return _dock_color("dock_plus_button_color", PLUS_BUTTON_COLOR)
 
 
 def _dock_outline_color():
@@ -2165,6 +2226,123 @@ class MBB_OT_new_blend_bookmark(bpy.types.Operator):
 
     def execute(self, context):
         return _execute_or_defer(lambda: (_create_untitled_bookmark(bpy.context, save_current=True), {"FINISHED"})[1])
+
+
+class MBB_OT_save_original_project(bpy.types.Operator):
+    bl_idname = SAVE_ORIGINAL_OPERATOR_ID
+    bl_label = "Save Project"
+    bl_description = "Save the current bookmark project to its original file location"
+    bl_options = {"INTERNAL"}
+
+    filepath: StringProperty(name="File Path", subtype="FILE_PATH")
+    filter_glob: StringProperty(default="*.blend", options={"HIDDEN"})
+
+    def invoke(self, context, _event):
+        current = _current_blend_filepath()
+        tab = _find_tab_by_any_path(current) or _active_registry_tab()
+        target = _manual_save_target_from_tab(tab, current)
+        if not target and current and not _is_cache_file_path(current) and not _is_untitled_path(current):
+            target = bpy.path.abspath(current)
+        if target:
+            self.filepath = target
+            return self.execute(context)
+        self.filepath = bpy.path.abspath(current) if current and not _is_cache_file_path(current) else ""
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        filepath = bpy.path.abspath(self.filepath) if self.filepath else ""
+        if not filepath:
+            self.report({"ERROR"}, "Choose a file path before saving.")
+            return {"CANCELLED"}
+        if not filepath.lower().endswith(".blend"):
+            filepath += ".blend"
+
+        current = _current_blend_filepath()
+        tab = _find_tab_by_any_path(current) or _active_registry_tab()
+        old_original = bpy.path.abspath(tab.get("filepath", "")) if tab else ""
+        cache_path = bpy.path.abspath(tab.get("cache_filepath", "")) if tab and tab.get("cache_filepath", "") else bpy.path.abspath(current)
+
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        bpy.ops.wm.save_as_mainfile(
+            "EXEC_DEFAULT",
+            filepath=filepath,
+            copy=True,
+            check_existing=False,
+        )
+
+        if old_original and old_original != filepath and (_is_cache_file_path(old_original) or _is_untitled_path(old_original)):
+            _remove_registry_tab(old_original)
+        _upsert_registry_tab(
+            filepath,
+            _title_from_path(filepath),
+            cache_filepath=cache_path if cache_path else None,
+            thumbnail_placeholder=False,
+            ui_state_hash=_current_ui_state_hash(context),
+            is_active=True,
+        )
+        _sync_registry_to_properties(context)
+        self.report({"INFO"}, f"Saved project to original file: {filepath}")
+        return {"FINISHED"}
+
+
+class MBB_OT_change_ui_color_menu(bpy.types.Operator):
+    bl_idname = "wm.mbb_change_ui_color_menu"
+    bl_label = "Change UI Color"
+    bl_description = "Edit dock UI colors"
+    bl_options = {"INTERNAL"}
+
+    def draw(self, context):
+        prefs = _addon_preferences()
+        if not prefs:
+            return
+        layout = self.layout
+        layout.operator(MBB_OT_reset_ui_colors.bl_idname, text=_t("Reset UI Colors"), icon="FILE_REFRESH")
+        for label, prop_name in (
+            ("Panel", "dock_inner_color"),
+            ("Selected", "dock_selected_color"),
+            ("Tab", "dock_tab_color"),
+            ("Button", "dock_button_color"),
+            ("Plus button", "dock_plus_button_color"),
+            ("Outline", "dock_outline_color"),
+            ("Text", "dock_text_color"),
+        ):
+            layout.prop(prefs, prop_name, text=_t(label))
+
+    def execute(self, _context):
+        return {"FINISHED"}
+
+    def invoke(self, context, _event):
+        return context.window_manager.invoke_popup(self, width=135)
+
+
+class MBB_OT_reset_ui_colors(bpy.types.Operator):
+    bl_idname = "wm.mbb_reset_ui_colors"
+    bl_label = "Reset UI Colors"
+    bl_description = "Reset dock UI colors to their default values"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        prefs = _addon_preferences()
+        if not prefs:
+            return {"CANCELLED"}
+        defaults = (
+            ("dock_inner_color", DOCK_INNER_COLOR),
+            ("dock_selected_color", DOCK_SELECTED_COLOR),
+            ("dock_tab_color", DOCK_TAB_COLOR),
+            ("dock_button_color", ADD_BUTTON_BLUE),
+            ("dock_plus_button_color", PLUS_BUTTON_COLOR),
+            ("dock_outline_color", DOCK_OUTLINE_COLOR),
+            ("dock_text_color", DOCK_TEXT_COLOR),
+        )
+        for prop_name, value in defaults:
+            setattr(prefs, prop_name, value)
+        _request_view3d_redraw(context)
+        try:
+            bpy.ops.wm.redraw_timer(type="DRAW_WIN_SWAP", iterations=1)
+        except Exception:
+            pass
+        return {"FINISHED"}
 
 
 class MBB_OT_open_bookmark(bpy.types.Operator):
@@ -2781,13 +2959,14 @@ def _draw_thick_line(x1, y1, x2, y2, thickness, color):
     gpu.state.blend_set("NONE")
 
 
-def _draw_plus_icon(cx, cy, size, color=(0.05, 0.31, 0.72, 1.0)):
+def _draw_plus_icon(cx, cy, size, color=(0.05, 0.31, 0.72, 1.0), stroke_scale=1.0):
     half = size * 0.5
-    _draw_thick_line(cx - half, cy, cx + half, cy, 3.9, color)
-    _draw_thick_line(cx, cy - half, cx, cy + half, 3.9, color)
+    thickness = 3.9 * stroke_scale
+    _draw_thick_line(cx - half, cy, cx + half, cy, thickness, color)
+    _draw_thick_line(cx, cy - half, cx, cy + half, thickness, color)
 
 
-def _draw_grid_icon(x, y, size, color=(0.18, 0.40, 0.95, 1.0)):
+def _draw_grid_icon(x, y, size, color=(0.18, 0.40, 0.95, 1.0), stroke_scale=1.0):
     center_x = x + size * 0.5
     center_y = y + size * 0.5
     cell = size * 0.35
@@ -2801,13 +2980,13 @@ def _draw_grid_icon(x, y, size, color=(0.18, 0.40, 0.95, 1.0)):
                 origin_y + row * (cell + gap),
                 cell,
                 cell,
-                2.5,
-                2.7,
+                2.5 * stroke_scale,
+                2.7 * stroke_scale,
                 color,
             )
 
 
-def _draw_list_icon(x, y, size, color=(0.38, 0.42, 0.48, 1.0)):
+def _draw_list_icon(x, y, size, color=(0.38, 0.42, 0.48, 1.0), stroke_scale=1.0):
     # Keep the glyph optically centered in the same square used by the grid
     # icon. The previous version started at the lower edge, so the active pill
     # looked off-center even when the outer box was centered.
@@ -2817,14 +2996,15 @@ def _draw_list_icon(x, y, size, color=(0.38, 0.42, 0.48, 1.0)):
     line_x1 = x + size * 0.40
     line_x2 = x + size * 0.84
     for yy in (center_y + spacing, center_y, center_y - spacing):
-        _draw_circle(bullet_x, yy, 2.15, color, 12)
-        _draw_thick_line(line_x1, yy, line_x2, yy, 2.75, color)
+        _draw_circle(bullet_x, yy, 2.15 * stroke_scale, color, 12)
+        _draw_thick_line(line_x1, yy, line_x2, yy, 2.75 * stroke_scale, color)
 
 
-def _draw_close_icon(cx, cy, size, color=(0.25, 0.31, 0.42, 0.92)):
+def _draw_close_icon(cx, cy, size, color=(0.25, 0.31, 0.42, 0.92), stroke_scale=1.0):
     half = size * 0.5
-    _draw_thick_line(cx - half, cy - half, cx + half, cy + half, 2.9, color)
-    _draw_thick_line(cx - half, cy + half, cx + half, cy - half, 2.9, color)
+    thickness = 2.9 * stroke_scale
+    _draw_thick_line(cx - half, cy - half, cx + half, cy + half, thickness, color)
+    _draw_thick_line(cx - half, cy + half, cx + half, cy - half, thickness, color)
 
 
 def _draw_browser_icon(x, y, size, active=True, hovered=False):
@@ -2834,17 +3014,17 @@ def _draw_browser_icon(x, y, size, active=True, hovered=False):
     _draw_bookmark_icon(x + size * 0.25, y + size * 0.18, size * 0.50, color)
 
 
-def _draw_new_file_icon(x, y, size, color=(0.74, 0.86, 1.0, 1.0)):
+def _draw_new_file_icon(x, y, size, color=(0.74, 0.86, 1.0, 1.0), stroke_scale=1.0):
     # Inspired by Microsoft Fluent UI System Icons (MIT). It is redrawn here
     # with GPU primitives so the add-on remains a single installable .py file.
     body_w = size * 0.68
     body_h = size * 0.82
-    _draw_rounded_rect_outline(x, y, body_w, body_h, size * 0.14, 2.7, color)
-    _draw_thick_line(x + body_w * 0.30, y + body_h * 0.57, x + body_w * 0.68, y + body_h * 0.57, 2.5, color)
-    _draw_thick_line(x + body_w * 0.30, y + body_h * 0.41, x + body_w * 0.58, y + body_h * 0.41, 2.5, color)
+    _draw_rounded_rect_outline(x, y, body_w, body_h, size * 0.14, 2.7 * stroke_scale, color)
+    _draw_thick_line(x + body_w * 0.30, y + body_h * 0.57, x + body_w * 0.68, y + body_h * 0.57, 2.5 * stroke_scale, color)
+    _draw_thick_line(x + body_w * 0.30, y + body_h * 0.41, x + body_w * 0.58, y + body_h * 0.41, 2.5 * stroke_scale, color)
     badge_cx = x + body_w * 0.82
     badge_cy = y + body_h * 0.20
-    _draw_plus_icon(badge_cx, badge_cy, 7.4, color)
+    _draw_plus_icon(badge_cx, badge_cy, 7.4 * stroke_scale, color, stroke_scale)
 
 
 def _draw_open_plus_icon(x, y, size, color=(0.78, 0.88, 1.0, 1.0)):
@@ -3284,8 +3464,9 @@ def _draw_view3d_tab_bar():
     hovered_new = _is_hit_hovered("new", -1, area_id)
     text_color = _dock_text_color()
     button_color = _dock_button_color()
+    icon_stroke_scale = _dock_icon_stroke_scale()
     _draw_frosted_panel(x, control_y, new_button_width, control_height, control_height * 0.5, active=False, hovered=hovered_new)
-    _draw_new_file_icon(x + (13 * scale), control_y + (control_height - (25 * scale) * 0.82) * 0.5, 25 * scale, text_color)
+    _draw_new_file_icon(x + (13 * scale), control_y + (control_height - (25 * scale) * 0.82) * 0.5, 25 * scale, text_color, icon_stroke_scale)
     _draw_centered_text("New", x + (30 * scale), control_y, new_button_width - (30 * scale), control_height, 14 * scale, text_color)
     x += new_button_width + tab_group_gap
 
@@ -3319,9 +3500,9 @@ def _draw_view3d_tab_bar():
         close_y = y + (tab_height - (20 * scale)) * 0.5
         if hovered_close:
             _draw_rounded_rect(close_x, close_y, 20 * scale, 20 * scale, 10 * scale, _with_alpha(text_color, text_color[3] * 0.18))
-            _draw_close_icon(close_x + (10 * scale), close_y + (10 * scale), 9.2 * scale, text_color)
+            _draw_close_icon(close_x + (10 * scale), close_y + (10 * scale), 9.2 * scale, text_color, icon_stroke_scale)
         else:
-            _draw_close_icon(close_x + (10 * scale), close_y + (10 * scale), 8.6 * scale, text_color)
+            _draw_close_icon(close_x + (10 * scale), close_y + (10 * scale), 8.6 * scale, text_color, icon_stroke_scale)
 
         x += tab_width + tab_gap
 
@@ -3344,14 +3525,14 @@ def _draw_view3d_tab_bar():
     grid_icon_y = toggle_y + (7 * scale) + (icon_button_size - (14 * scale) - mode_icon_size) * 0.5
     list_icon_x = x + (48 * scale) + ((34 * scale) - mode_icon_size) * 0.5
     list_icon_y = grid_icon_y
-    _draw_grid_icon(grid_icon_x, grid_icon_y, mode_icon_size, _with_alpha(button_color, button_color[3] if grid_active or hovered_thumbs else button_color[3] * 0.82))
-    _draw_list_icon(list_icon_x, list_icon_y, mode_icon_size, _with_alpha(text_color, text_color[3] if list_active or hovered_names else text_color[3] * 0.82))
+    _draw_grid_icon(grid_icon_x, grid_icon_y, mode_icon_size, _with_alpha(button_color, button_color[3] if grid_active or hovered_thumbs else button_color[3] * 0.82), icon_stroke_scale)
+    _draw_list_icon(list_icon_x, list_icon_y, mode_icon_size, _with_alpha(text_color, text_color[3] if list_active or hovered_names else text_color[3] * 0.82), icon_stroke_scale)
     x += view_toggle_width + control_gap
 
     hovered_open = _is_hit_hovered("open", -1, area_id)
     plus_color = _mix_color(button_color, _with_alpha(ADD_BUTTON_BLUE_HOVER, button_color[3]), 0.35) if hovered_open else button_color
     _draw_circle(x + icon_button_size * 0.5, control_y + control_height * 0.5, control_height * 0.5, plus_color, 32)
-    _draw_plus_icon(x + icon_button_size * 0.5, control_y + control_height * 0.5, 16 * scale, (1.0, 1.0, 1.0, 1.0))
+    _draw_plus_icon(x + icon_button_size * 0.5, control_y + control_height * 0.5, 16 * scale, _dock_plus_button_color(), icon_stroke_scale)
 
 
 class MBB_OT_overlay_router(bpy.types.Operator):
@@ -3511,6 +3692,9 @@ classes = (
     MBB_BookmarkItem,
     MBB_OT_open_blend_bookmark,
     MBB_OT_new_blend_bookmark,
+    MBB_OT_save_original_project,
+    MBB_OT_change_ui_color_menu,
+    MBB_OT_reset_ui_colors,
     MBB_OT_open_bookmark,
     MBB_OT_remove_bookmark,
     MBB_OT_restore_closed_or_new,
@@ -3555,6 +3739,18 @@ def _register_keymaps():
             shift="SHIFT" in toggle_modifiers,
             alt="ALT" in toggle_modifiers,
             oskey="OSKEY" in toggle_modifiers,
+        )
+        addon_keymaps.append((km, kmi))
+    save_key, save_modifiers = _shortcut_parts(_shortcut_value("shortcut_save_origin"))
+    if save_key:
+        kmi = km.keymap_items.new(
+            SAVE_ORIGINAL_OPERATOR_ID,
+            save_key,
+            "PRESS",
+            ctrl="CTRL" in save_modifiers,
+            shift="SHIFT" in save_modifiers,
+            alt="ALT" in save_modifiers,
+            oskey="OSKEY" in save_modifiers,
         )
         addon_keymaps.append((km, kmi))
     for target in SHORTCUT_TARGETS:
