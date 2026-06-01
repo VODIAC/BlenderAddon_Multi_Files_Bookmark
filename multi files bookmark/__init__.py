@@ -11,7 +11,7 @@
 bl_info = {
     "name": "Multi Files Bookmark",
     "author": "61+",
-    "version": (0, 6, 8),
+    "version": (0, 6, 9),
     "blender": (5, 0, 0),
     "location": "3D View > Floating Top Tab Bar",
     "description": "Manage blend project as bookmarks in one Blender window",
@@ -97,6 +97,7 @@ _overlay_default_state = "NAMES"
 _overlay_saved_area_states = []
 _overlay_visibility_initialized = False
 _overlay_view_mode_state = "NAMES"
+_pending_overlay_state = ""
 _original_draw_xform_template = None
 _thumbnail_textures = {}
 _sdf_round_rect_shader = None
@@ -104,21 +105,27 @@ _sdf_line_shader = None
 _sdf_shader_warning_printed = False
 
 SHORTCUT_DEFAULTS = {
-    "shortcut_restore_closed": "CTRL T",
+    "shortcut_open_file": "CTRL ALT O",
+    "shortcut_new_file": "CTRL T",
+    "shortcut_restore_closed": "CTRL SHIFT T",
     "shortcut_close": "CTRL W",
-    "shortcut_next": "CTRL TAB",
-    "shortcut_prev": "CTRL SHIFT TAB",
-    "shortcut_toggle_bar": "CTRL SHIFT ACCENT_GRAVE",
+    "shortcut_next": "BUTTON5MOUSE",
+    "shortcut_prev": "BUTTON4MOUSE",
+    "shortcut_toggle_bar": "ALT F1",
     "shortcut_save_origin": "ALT OSKEY S",
 }
 
 SHORTCUT_TARGETS = (
+    "shortcut_open_file",
+    "shortcut_new_file",
     "shortcut_close",
     "shortcut_restore_closed",
     "shortcut_next",
     "shortcut_prev",
 )
 SHORTCUT_TARGET_LABELS = {
+    "shortcut_open_file": "Open Project",
+    "shortcut_new_file": "New Project",
     "shortcut_restore_closed": "Reopen Closed",
     "shortcut_close": "Close Selected",
     "shortcut_next": "Switch to Next",
@@ -1587,6 +1594,7 @@ def _create_untitled_bookmark(context=None, save_current=True):
         _save_current_project_to_cache(capture_thumbnail=True)
 
     context = context or bpy.context
+    _remember_overlay_state(context=context)
     cache_path = _next_untitled_cache_path()
     bpy.ops.wm.read_homefile(
         "EXEC_DEFAULT",
@@ -1600,6 +1608,9 @@ def _create_untitled_bookmark(context=None, save_current=True):
         copy=False,
         check_existing=False,
     )
+    context = bpy.context
+    if _pending_overlay_state in OVERLAY_STATES:
+        _initialize_overlay_state_from_disk(context)
     _upsert_registry_tab(
         cache_path,
         _title_from_path(cache_path),
@@ -1609,7 +1620,9 @@ def _create_untitled_bookmark(context=None, save_current=True):
         ui_state_hash=_current_ui_state_hash(context),
         is_active=True,
     )
+    _set_active_in_registry(cache_path)
     _sync_registry_to_properties(context)
+    _set_single_selection_for_path(context, cache_path)
     return cache_path
 
 
@@ -1782,17 +1795,36 @@ class MBB_AddonPreferences(bpy.types.AddonPreferences):
         default=DEFAULT_CACHE_DIR,
         subtype="DIR_PATH",
     )
+    shortcut_scope: EnumProperty(
+        name="Keymap Scope",
+        description="Choose whether bookmark shortcuts work everywhere or only while the mouse is over the dock",
+        items=(
+            ("GLOBAL", "Global Range", "Bookmark shortcuts work everywhere"),
+            ("PANEL", "Bookmark Dock Only", "Bookmark shortcuts work only while the mouse is over the dock"),
+        ),
+        default="GLOBAL",
+    )
+    show_hover_full_name: BoolProperty(
+        name="Show Full Name on Hover",
+        description="Show the full project name while hovering a bookmark tab",
+        default=True,
+    )
+    show_hover_file_path: BoolProperty(
+        name="Show File Path on Hover",
+        description="Show the original file path while hovering a bookmark tab",
+        default=True,
+    )
 
     def draw(self, context):
         layout = self.layout
         intro = layout.column(align=True)
         intro.label(text=_t(INTRO_TEXT))
+        self.draw_user_pref_and_color_pair(layout)
         self.draw_control_pair(layout)
-        self.draw_color_and_cache_pair(layout)
-        self.draw_save_and_toggle_pair(layout)
-        targets = list(SHORTCUT_TARGETS)
-        for offset in range(0, len(targets), 2):
-            self.draw_shortcut_pair(layout, targets[offset], targets[offset + 1] if offset + 1 < len(targets) else "")
+        self.draw_shortcut_pair(layout, "shortcut_toggle_bar", "shortcut_save_origin")
+        self.draw_shortcut_pair(layout, "shortcut_open_file", "shortcut_close")
+        self.draw_shortcut_pair(layout, "shortcut_new_file", "shortcut_restore_closed")
+        self.draw_shortcut_pair(layout, "shortcut_prev", "shortcut_next")
 
     def draw_control_pair(self, layout):
         row = layout.row(align=True)
@@ -1811,13 +1843,22 @@ class MBB_AddonPreferences(bpy.types.AddonPreferences):
         control_area = cell.row(align=True)
         control_area.prop(self, prop_name, text="", slider=True)
 
-    def draw_color_and_cache_pair(self, layout):
+    def draw_user_pref_and_color_pair(self, layout):
         row = layout.row(align=True)
         left_col = row.column(align=True)
-        self.draw_color_menu_cell(left_col)
+        self.draw_user_pref_menu_cell(left_col)
         row.separator(factor=1.6)
         right_col = row.column(align=True)
-        self.draw_cache_cell(right_col)
+        self.draw_color_menu_cell(right_col)
+
+    def draw_user_pref_menu_cell(self, layout):
+        cell = layout.split(factor=0.48, align=True)
+        label_area = cell.row(align=True)
+        label_area.label(text="", icon="PREFERENCES")
+        label_area.separator(factor=0.35)
+        label_area.label(text=_t("User Pref"))
+        control_area = cell.row(align=True)
+        control_area.operator(MBB_OT_user_pref_menu.bl_idname, text=_t("Open List"), icon="DOWNARROW_HLT")
 
     def draw_color_menu_cell(self, layout):
         cell = layout.split(factor=0.48, align=True)
@@ -1827,26 +1868,6 @@ class MBB_AddonPreferences(bpy.types.AddonPreferences):
         label_area.label(text=_t("Change UI Color"))
         control_area = cell.row(align=True)
         control_area.operator(MBB_OT_change_ui_color_menu.bl_idname, text=_t("Open List"), icon="DOWNARROW_HLT")
-
-    def draw_save_and_toggle_pair(self, layout):
-        row = layout.row(align=True)
-        left_col = row.column(align=True)
-        self.draw_shortcut_row(left_col, "shortcut_save_origin")
-        row.separator(factor=1.6)
-        right_col = row.column(align=True)
-        self.draw_toggle_shortcut_cell(right_col)
-
-    def draw_cache_cell(self, layout):
-        cell = layout.split(factor=0.48, align=True)
-        label_area = cell.row(align=True)
-        label_area.label(text="", icon="FILE_FOLDER")
-        label_area.separator(factor=0.35)
-        label_area.label(text=_t("Cache Folder"))
-        control_area = cell.row(align=True)
-        control_area.prop(self, "cache_directory", text="")
-
-    def draw_toggle_shortcut_cell(self, layout):
-        self.draw_shortcut_row(layout, "shortcut_toggle_bar")
 
     def draw_shortcut_pair(self, layout, left_target, right_target):
         row = layout.row(align=True)
@@ -1943,23 +1964,32 @@ def _overlay_project_key(context=None):
 
 
 def _initialize_overlay_state_from_disk(context=None):
-    global _overlay_default_state, _overlay_saved_area_states, _overlay_area_states, _overlay_area_previous_modes, _overlay_view_mode_state
+    global _overlay_default_state, _overlay_saved_area_states, _overlay_area_states, _overlay_area_previous_modes, _overlay_view_mode_state, _pending_overlay_state
+    context = context or bpy.context
+    handoff_state = _pending_overlay_state if _pending_overlay_state in OVERLAY_STATES else ""
+    _pending_overlay_state = ""
+    handoff_primary_id = _area_id(_primary_view3d_area(context)) if handoff_state else ""
     data = _read_overlay_state_file()
     project_data = data.get("projects", {}).get(_overlay_project_key(context), {})
     _overlay_saved_area_states = [_clean_overlay_state(state, "HIDDEN") for state in project_data.get("area_states", [])]
     _overlay_default_state = "HIDDEN"
     _overlay_area_states.clear()
     _overlay_area_previous_modes.clear()
-    for index, area in enumerate(_view3d_areas_sorted(getattr(context or bpy.context, "screen", None))):
+    for index, area in enumerate(_view3d_areas_sorted(getattr(context, "screen", None))):
         area_id = _area_id(area)
         if not area_id:
             continue
-        state = _overlay_saved_area_states[index] if index < len(_overlay_saved_area_states) else "HIDDEN"
+        if handoff_state and area_id == handoff_primary_id:
+            state = handoff_state
+        else:
+            state = _overlay_saved_area_states[index] if index < len(_overlay_saved_area_states) else "HIDDEN"
         _overlay_area_states[area_id] = _clean_overlay_state(state, "HIDDEN")
         if _overlay_area_states[area_id] in VISIBLE_OVERLAY_STATES:
             _overlay_area_previous_modes[area_id] = _overlay_area_states[area_id]
     view_mode = project_data.get("view_mode", "NAMES") if isinstance(project_data, dict) else "NAMES"
     _overlay_view_mode_state = "THUMBNAILS" if _clean_overlay_state(view_mode) == "THUMBNAILS" else "NAMES"
+    if handoff_state in VISIBLE_OVERLAY_STATES:
+        _overlay_view_mode_state = "THUMBNAILS" if handoff_state == "THUMBNAILS" else "NAMES"
 
 
 def _overlay_state_for_area(area=None, area_id=""):
@@ -1975,6 +2005,22 @@ def _overlay_state_for_area(area=None, area_id=""):
 def _overlay_view_mode(area_id="", area=None):
     state = _overlay_state_for_area(area, area_id)
     return "THUMBNAILS" if state == "THUMBNAILS" else "NAMES"
+
+
+def _state_for_overlay_handoff(area_id="", context=None):
+    primary = _primary_view3d_area(context or bpy.context)
+    primary_id = _area_id(primary)
+    if primary_id:
+        area_id = primary_id
+    return _clean_overlay_state(_overlay_area_states.get(area_id, "HIDDEN"), "HIDDEN") if area_id else "HIDDEN"
+
+
+def _remember_overlay_state(area_id="", context=None):
+    global _pending_overlay_state
+    if _pending_overlay_state in OVERLAY_STATES:
+        return _pending_overlay_state
+    _pending_overlay_state = _state_for_overlay_handoff(area_id, context)
+    return _pending_overlay_state
 
 
 def _persist_overlay_state(context=None):
@@ -2098,6 +2144,11 @@ def _scaled(value):
     return value * _dock_ui_scale()
 
 
+def _shortcuts_are_global():
+    prefs = _addon_preferences()
+    return not prefs or getattr(prefs, "shortcut_scope", "GLOBAL") == "GLOBAL"
+
+
 def _shortcut_value(prop_name):
     return _normalize_shortcut(SHORTCUT_DEFAULTS.get(prop_name, ""))
 
@@ -2106,12 +2157,16 @@ def _open_mainfile_current_window(filepath):
     # load_ui=True is intentional: every .blend owns its saved Workspaces,
     # screens, editor split layout, and UI state. Keeping it False would force
     # all projects to inherit the currently visible Blender page layout.
-    return bpy.ops.wm.open_mainfile(
+    _remember_overlay_state(context=bpy.context)
+    result = bpy.ops.wm.open_mainfile(
         "EXEC_DEFAULT",
         filepath=filepath,
         load_ui=True,
         display_file_selector=False,
     )
+    if _pending_overlay_state in OVERLAY_STATES:
+        _initialize_overlay_state_from_disk(bpy.context)
+    return result
 
 
 def _is_current_file_dirty():
@@ -2148,7 +2203,7 @@ def _defer_ui_action(action):
         action()
 
 
-def _restore_closed_or_new_impl(context):
+def _restore_closed_impl(context):
     global _last_closed_tabs
     restored = []
     data = _clean_registry(_read_registry())
@@ -2172,7 +2227,7 @@ def _restore_closed_or_new_impl(context):
 
     if not restored:
         _last_closed_tabs = []
-        return bpy.ops.wm.mbb_new_blend()
+        return {"CANCELLED"}
 
     active_tab = restored[-1]
     active_key = bpy.path.abspath(active_tab["filepath"])
@@ -2213,8 +2268,11 @@ class MBB_OT_open_blend_bookmark(bpy.types.Operator):
             self.report({"ERROR"}, "Please select a .blend file.")
             return {"CANCELLED"}
 
+        _remember_overlay_state(context=context)
         _save_current_project_to_cache(capture_thumbnail=True)
         _upsert_registry_tab(filepath, _title_from_path(filepath), is_active=True)
+        _sync_registry_to_properties(context)
+        _set_single_selection_for_path(context, filepath)
         return _open_mainfile_current_window(filepath)
 
 
@@ -2224,7 +2282,12 @@ class MBB_OT_new_blend_bookmark(bpy.types.Operator):
     bl_description = "Create a new unnamed Blender project tab in this window"
     bl_options = {"INTERNAL"}
 
+    @classmethod
+    def poll(cls, _context):
+        return bpy.app.background or _shortcuts_are_global() or _mouse_over_any_dock()
+
     def execute(self, context):
+        _remember_overlay_state(context=context)
         return _execute_or_defer(lambda: (_create_untitled_bookmark(bpy.context, save_current=True), {"FINISHED"})[1])
 
 
@@ -2236,6 +2299,10 @@ class MBB_OT_save_original_project(bpy.types.Operator):
 
     filepath: StringProperty(name="File Path", subtype="FILE_PATH")
     filter_glob: StringProperty(default="*.blend", options={"HIDDEN"})
+
+    @classmethod
+    def poll(cls, _context):
+        return True
 
     def invoke(self, context, _event):
         current = _current_blend_filepath()
@@ -2314,6 +2381,36 @@ class MBB_OT_change_ui_color_menu(bpy.types.Operator):
 
     def invoke(self, context, _event):
         return context.window_manager.invoke_popup(self, width=135)
+
+
+class MBB_OT_user_pref_menu(bpy.types.Operator):
+    bl_idname = "wm.mbb_user_pref_menu"
+    bl_label = "User Pref"
+    bl_description = "Edit bookmark user preferences"
+    bl_options = {"INTERNAL"}
+
+    def draw(self, context):
+        prefs = _addon_preferences()
+        if not prefs:
+            return
+        layout = self.layout
+        self.draw_compact_prop(layout, prefs, "shortcut_scope", _t("Keymap Scope"))
+        self.draw_compact_prop(layout, prefs, "cache_directory", _t("Cache Folder"))
+        layout.prop(prefs, "show_hover_full_name", text=_t("Show Full Name on Hover"))
+        layout.prop(prefs, "show_hover_file_path", text=_t("Show File Path on Hover"))
+
+    def draw_compact_prop(self, layout, prefs, prop_name, label):
+        row = layout.row(align=True)
+        split = row.split(factor=0.31, align=True)
+        split.label(text=f"{label}:")
+        right = split.row(align=True)
+        right.prop(prefs, prop_name, text="")
+
+    def execute(self, _context):
+        return {"FINISHED"}
+
+    def invoke(self, context, _event):
+        return context.window_manager.invoke_popup(self, width=300)
 
 
 class MBB_OT_reset_ui_colors(bpy.types.Operator):
@@ -2449,12 +2546,12 @@ class MBB_OT_remove_bookmark(bpy.types.Operator):
 
 class MBB_OT_restore_closed_or_new(bpy.types.Operator):
     bl_idname = "wm.mbb_restore_closed_or_new"
-    bl_label = "Reopen Closed Bookmark or New"
-    bl_description = "Reopen tabs from the last close action, or create a new project if nothing was closed in this window"
+    bl_label = "Reopen Closed Bookmark"
+    bl_description = "Reopen tabs from the last close action"
     bl_options = {"INTERNAL"}
 
     def execute(self, context):
-        return _execute_or_defer(lambda: _restore_closed_or_new_impl(bpy.context))
+        return _execute_or_defer(lambda: _restore_closed_impl(bpy.context))
 
 
 class MBB_OT_toggle_area_tab_bar(bpy.types.Operator):
@@ -2462,6 +2559,10 @@ class MBB_OT_toggle_area_tab_bar(bpy.types.Operator):
     bl_label = "Toggle Bookmark Bar"
     bl_description = "Show or hide the Multi Blender Bookmark floating tab bar for this 3D View"
     bl_options = {"INTERNAL"}
+
+    @classmethod
+    def poll(cls, _context):
+        return True
 
     def execute(self, context):
         area = getattr(context, "area", None)
@@ -2551,9 +2652,15 @@ class MBB_OT_dock_shortcut(bpy.types.Operator):
 
     @classmethod
     def poll(cls, _context):
-        return bpy.app.background or _mouse_over_any_dock()
+        return bpy.app.background or _shortcuts_are_global() or _mouse_over_any_dock()
 
     def execute(self, _context):
+        if self.target == "shortcut_open_file":
+            _remember_overlay_state(context=bpy.context)
+            return _execute_or_defer(lambda: bpy.ops.wm.mbb_open_blend("INVOKE_DEFAULT"))
+        if self.target == "shortcut_new_file":
+            _remember_overlay_state(context=bpy.context)
+            return _execute_or_defer(lambda: bpy.ops.wm.mbb_new_blend())
         if self.target == "shortcut_restore_closed":
             return _execute_or_defer(lambda: bpy.ops.wm.mbb_restore_closed_or_new())
         if self.target == "shortcut_close":
@@ -2885,6 +2992,90 @@ def _draw_centered_text(text, x, y, w, h, size=14, color=(0.12, 0.16, 0.22, 1.0)
     tx = x + (w - text_w) * 0.5
     ty = y + (h - text_h) * 0.5 + text_h * 0.16
     _draw_text(text, tx, ty, size, color)
+
+
+def _wrap_text_to_width(text, size, max_width):
+    text = str(text or "")
+    if not text:
+        return [""]
+    if _text_dimensions(text, size)[0] <= max_width:
+        return [text]
+
+    lines = []
+    current = ""
+    for char in text:
+        candidate = current + char
+        if current and _text_dimensions(candidate, size)[0] > max_width:
+            lines.append(current)
+            current = char
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines or [text]
+
+
+def _tab_tooltip_lines(tab):
+    original_path = bpy.path.abspath(tab.get("filepath", "")) if tab.get("filepath", "") else ""
+    title = tab.get("title", "") or _title_from_path(original_path)
+    if title.lower().endswith(".blend"):
+        title = title[:-6]
+    return title or "Untitled", original_path or "Unsaved"
+
+
+def _draw_tab_tooltip(tab, anchor_x, anchor_y, region_width, region_height):
+    prefs = _addon_preferences()
+    show_name = True if prefs is None else bool(getattr(prefs, "show_hover_full_name", True))
+    show_path = True if prefs is None else bool(getattr(prefs, "show_hover_file_path", True))
+    if not show_name and not show_path:
+        return
+
+    scale = _dock_ui_scale()
+    title, original_path = _tab_tooltip_lines(tab)
+    title_size = 14 * scale
+    path_size = 12 * scale
+    padding_x = 14 * scale
+    padding_y = 10 * scale
+    gap = 5 * scale
+    line_gap = 3 * scale
+    max_content_w = min(560 * scale, max(160 * scale, region_width - (OVERLAY_MARGIN * scale * 2.0) - padding_x * 2.0))
+
+    title_lines = _wrap_text_to_width(title, title_size, max_content_w) if show_name else []
+    path_lines = _wrap_text_to_width(original_path, path_size, max_content_w) if show_path else []
+    title_h = _text_dimensions("Ag", title_size)[1]
+    path_h = _text_dimensions("Ag", path_size)[1]
+    content_w = 0
+    for line in title_lines:
+        content_w = max(content_w, _text_dimensions(line, title_size)[0])
+    for line in path_lines:
+        content_w = max(content_w, _text_dimensions(line, path_size)[0])
+
+    box_w = content_w + padding_x * 2.0
+    box_h = padding_y * 2.0 + len(title_lines) * title_h + max(0, len(title_lines) - 1) * line_gap + len(path_lines) * path_h + max(0, len(path_lines) - 1) * line_gap
+    if title_lines and path_lines:
+        box_h += gap
+    x = min(max(OVERLAY_MARGIN * scale, anchor_x), max(OVERLAY_MARGIN * scale, region_width - box_w - OVERLAY_MARGIN * scale))
+    y = anchor_y - box_h - (8 * scale)
+    if y < OVERLAY_MARGIN * scale:
+        y = min(region_height - box_h - OVERLAY_MARGIN * scale, anchor_y + (8 * scale))
+
+    _draw_soft_shadow(x, y, box_w, box_h, 10 * scale)
+    _draw_rounded_rect(x, y, box_w, box_h, 10 * scale, (0.96, 0.98, 1.0, 0.98))
+    _draw_rounded_rect_outline(x, y, box_w, box_h, 10 * scale, 1.0 * scale, _with_alpha(_dock_outline_color(), 0.88))
+
+    text_x = x + padding_x
+    first_line_h = title_h if title_lines else path_h
+    text_y = y + box_h - padding_y - first_line_h
+    title_color = _dock_text_color()
+    path_color = _with_alpha(title_color, title_color[3] * 0.76)
+    for line in title_lines:
+        _draw_text(line, text_x, text_y, title_size, title_color)
+        text_y -= title_h + line_gap
+    if title_lines and path_lines:
+        text_y -= gap
+    for line in path_lines:
+        _draw_text(line, text_x, text_y, path_size, path_color)
+        text_y -= path_h + line_gap
 
 
 def _draw_circle(cx, cy, radius, color, segments=24):
@@ -3269,6 +3460,19 @@ def _set_single_selection(index):
         _selection_anchor_index = -1
 
 
+def _set_single_selection_for_path(context, filepath):
+    target = bpy.path.abspath(filepath) if filepath else ""
+    wm = _window_manager_from_context(context)
+    if not target or wm is None or not hasattr(wm, "mbb_bookmarks"):
+        _set_single_selection(-1)
+        return
+    for index, bookmark in enumerate(wm.mbb_bookmarks):
+        if bpy.path.abspath(bookmark.filepath) == target:
+            _set_single_selection(index)
+            return
+    _set_single_selection(-1)
+
+
 def _select_bookmark_range(context, index):
     global _selection_anchor_index
     count = len(context.window_manager.mbb_bookmarks)
@@ -3470,11 +3674,16 @@ def _draw_view3d_tab_bar():
     _draw_centered_text("New", x + (30 * scale), control_y, new_button_width - (30 * scale), control_height, 14 * scale, text_color)
     x += new_button_width + tab_group_gap
 
+    tooltip_tab = None
+    tooltip_anchor = (0, 0)
     for index, tab in enumerate(tabs):
         active = bool(tab.get("is_active", False))
         selected = _is_bookmark_selected(index)
         hovered_tab = _is_hit_hovered("switch", index, area_id)
         hovered_close = _is_hit_hovered("close", index, area_id)
+        if hovered_tab and not hovered_close:
+            tooltip_tab = tab
+            tooltip_anchor = (x + (12 * scale), y)
         _draw_frosted_panel(x, y, tab_width, tab_height, (control_height * 0.5) if not thumb_mode else (18 * scale), active=active or selected, hovered=hovered_tab)
         if selected:
             selected_outline = _dock_selected_color()
@@ -3533,6 +3742,8 @@ def _draw_view3d_tab_bar():
     plus_color = _mix_color(button_color, _with_alpha(ADD_BUTTON_BLUE_HOVER, button_color[3]), 0.35) if hovered_open else button_color
     _draw_circle(x + icon_button_size * 0.5, control_y + control_height * 0.5, control_height * 0.5, plus_color, 32)
     _draw_plus_icon(x + icon_button_size * 0.5, control_y + control_height * 0.5, 16 * scale, _dock_plus_button_color(), icon_stroke_scale)
+    if tooltip_tab is not None:
+        _draw_tab_tooltip(tooltip_tab, tooltip_anchor[0], tooltip_anchor[1], width, height)
 
 
 class MBB_OT_overlay_router(bpy.types.Operator):
@@ -3595,8 +3806,10 @@ class MBB_OT_overlay_router(bpy.types.Operator):
             if item:
                 _overlay_absorb_leftmouse_release = True
                 if item["action"] == "new":
+                    _remember_overlay_state(context=context)
                     _defer_ui_action(lambda: bpy.ops.wm.mbb_new_blend())
                 elif item["action"] == "open":
+                    _remember_overlay_state(context=context)
                     _defer_ui_action(lambda: bpy.ops.wm.mbb_open_blend("INVOKE_DEFAULT"))
                 elif item["action"] == "view_names":
                     _set_overlay_area_state(item.get("area_id", ""), "NAMES", context)
@@ -3694,6 +3907,7 @@ classes = (
     MBB_OT_new_blend_bookmark,
     MBB_OT_save_original_project,
     MBB_OT_change_ui_color_menu,
+    MBB_OT_user_pref_menu,
     MBB_OT_reset_ui_colors,
     MBB_OT_open_bookmark,
     MBB_OT_remove_bookmark,
@@ -3874,14 +4088,3 @@ def unregister():
 
 if __name__ == "__main__":
     register()
-
-
-
-
-
-
-
-
-
-
-
