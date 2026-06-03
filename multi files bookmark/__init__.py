@@ -11,7 +11,7 @@
 bl_info = {
     "name": "Multi Files Bookmark",
     "author": "61+",
-    "version": (0, 6, 9),
+    "version": (0, 6, 10),
     "blender": (5, 0, 0),
     "location": "3D View > Floating Top Tab Bar",
     "description": "Manage blend project as bookmarks in one Blender window",
@@ -81,6 +81,8 @@ DOCK_TAB_COLOR = (1.0, 1.0, 1.0, 0.985)
 DOCK_SELECTED_COLOR = (0.76, 0.84, 1.0, 0.92)
 DOCK_OUTLINE_COLOR = (1.0, 1.0, 1.0, 0.76)
 DOCK_TEXT_COLOR = (0.05, 0.06, 0.08, 0.96)
+TOOLTIP_BACKGROUND_COLOR = (0.96, 0.98, 1.0, 0.98)
+TOOLTIP_TEXT_COLOR = (0.05, 0.06, 0.08, 0.96)
 
 addon_keymaps = []
 _overlay_draw_handler = None
@@ -105,7 +107,6 @@ _sdf_line_shader = None
 _sdf_shader_warning_printed = False
 
 SHORTCUT_DEFAULTS = {
-    "shortcut_open_file": "CTRL ALT O",
     "shortcut_new_file": "CTRL T",
     "shortcut_restore_closed": "CTRL SHIFT T",
     "shortcut_close": "CTRL W",
@@ -116,7 +117,6 @@ SHORTCUT_DEFAULTS = {
 }
 
 SHORTCUT_TARGETS = (
-    "shortcut_open_file",
     "shortcut_new_file",
     "shortcut_close",
     "shortcut_restore_closed",
@@ -124,7 +124,6 @@ SHORTCUT_TARGETS = (
     "shortcut_prev",
 )
 SHORTCUT_TARGET_LABELS = {
-    "shortcut_open_file": "Open Project",
     "shortcut_new_file": "New Project",
     "shortcut_restore_closed": "Reopen Closed",
     "shortcut_close": "Close Selected",
@@ -142,6 +141,7 @@ INTRO_TEXT = "Dock bar sits atop the 3D View and toggles via the bookmark icon o
 
 OVERLAY_STATES = {"HIDDEN", "NAMES", "THUMBNAILS"}
 VISIBLE_OVERLAY_STATES = {"NAMES", "THUMBNAILS"}
+UNSAVED_FILE_LABEL = "Current file is unsaved"
 
 
 _selected_bookmark_indices = set()
@@ -1562,11 +1562,10 @@ def _next_remaining_tab_after_close(tabs, closing_indices, active_index):
         return None
     if active_index < 0:
         active_index = 0
-    for offset in range(1, len(tabs) + 1):
-        candidate = (active_index + offset) % len(tabs)
-        if candidate not in closing:
+    for candidate in remaining_indices:
+        if candidate > active_index:
             return tabs[candidate]
-    return tabs[remaining_indices[0]]
+    return tabs[remaining_indices[-1]]
 
 
 def _write_tabs_after_close(context, tabs_to_close, fallback_tab=None):
@@ -1789,6 +1788,26 @@ class MBB_AddonPreferences(bpy.types.AddonPreferences):
         default=DOCK_TEXT_COLOR,
         update=_redraw_dock_preferences,
     )
+    tooltip_background_color: FloatVectorProperty(
+        name="Tooltip Background",
+        description="Background color of bookmark hover tooltips",
+        subtype="COLOR",
+        size=4,
+        min=0.0,
+        max=1.0,
+        default=TOOLTIP_BACKGROUND_COLOR,
+        update=_redraw_dock_preferences,
+    )
+    tooltip_text_color: FloatVectorProperty(
+        name="Tooltip Text",
+        description="Text color of bookmark hover tooltips",
+        subtype="COLOR",
+        size=4,
+        min=0.0,
+        max=1.0,
+        default=TOOLTIP_TEXT_COLOR,
+        update=_redraw_dock_preferences,
+    )
     cache_directory: StringProperty(
         name="Cache Folder",
         description="Folder for cached .blend files and bookmark thumbnails",
@@ -1822,9 +1841,9 @@ class MBB_AddonPreferences(bpy.types.AddonPreferences):
         self.draw_user_pref_and_color_pair(layout)
         self.draw_control_pair(layout)
         self.draw_shortcut_pair(layout, "shortcut_toggle_bar", "shortcut_save_origin")
-        self.draw_shortcut_pair(layout, "shortcut_open_file", "shortcut_close")
-        self.draw_shortcut_pair(layout, "shortcut_new_file", "shortcut_restore_closed")
-        self.draw_shortcut_pair(layout, "shortcut_prev", "shortcut_next")
+        self.draw_shortcut_pair(layout, "shortcut_new_file", "shortcut_close")
+        self.draw_shortcut_pair(layout, "shortcut_restore_closed", "shortcut_prev")
+        self.draw_last_shortcut_row(layout, "shortcut_next")
 
     def draw_control_pair(self, layout):
         row = layout.row(align=True)
@@ -1878,8 +1897,7 @@ class MBB_AddonPreferences(bpy.types.AddonPreferences):
         if right_target:
             self.draw_shortcut_row(right_col, right_target)
         else:
-            empty = right_col.row(align=True)
-            empty.label(text="")
+            self.draw_empty_shortcut_row(right_col)
 
     def draw_shortcut_row(self, layout, target):
         _kc, _km, kmi = _keymap_item_for_target(target)
@@ -1897,6 +1915,20 @@ class MBB_AddonPreferences(bpy.types.AddonPreferences):
         label_area.label(text=_t(SHORTCUT_TARGET_LABELS[target]))
         control_area = cell.row(align=True)
         control_area.prop(kmi, "type", text="", full_event=True)
+
+    def draw_empty_shortcut_row(self, layout):
+        cell = layout.split(factor=0.48, align=True)
+        label_area = cell.row(align=True)
+        label_area.label(text="")
+        control_area = cell.row(align=True)
+        control_area.label(text="")
+
+    def draw_last_shortcut_row(self, layout, target):
+        row = layout.split(factor=0.5, align=True)
+        left_col = row.column(align=True)
+        self.draw_shortcut_row(left_col, target)
+        right_col = row.column(align=True)
+        right_col.label(text="")
 
 def _clean_overlay_state(state, fallback="NAMES"):
     state = str(state or "").upper()
@@ -2131,6 +2163,14 @@ def _dock_text_color():
     return _dock_color("dock_text_color", DOCK_TEXT_COLOR)
 
 
+def _tooltip_background_color():
+    return _dock_color("tooltip_background_color", TOOLTIP_BACKGROUND_COLOR)
+
+
+def _tooltip_text_color():
+    return _dock_color("tooltip_text_color", TOOLTIP_TEXT_COLOR)
+
+
 def _mix_color(a, b, factor):
     factor = max(0.0, min(1.0, float(factor)))
     return tuple((a[index] * (1.0 - factor)) + (b[index] * factor) for index in range(4))
@@ -2153,15 +2193,39 @@ def _shortcut_value(prop_name):
     return _normalize_shortcut(SHORTCUT_DEFAULTS.get(prop_name, ""))
 
 
-def _open_mainfile_current_window(filepath):
-    # load_ui=True is intentional: every .blend owns its saved Workspaces,
-    # screens, editor split layout, and UI state. Keeping it False would force
-    # all projects to inherit the currently visible Blender page layout.
+def _file_browser_preferences():
+    return getattr(bpy.context.preferences, "filepaths", None)
+
+
+def _default_load_ui():
+    prefs = _file_browser_preferences()
+    return bool(getattr(prefs, "use_load_ui", True)) if prefs else True
+
+
+def _default_trusted_source():
+    prefs = _file_browser_preferences()
+    return bool(getattr(prefs, "use_scripts_auto_execute", False)) if prefs else False
+
+
+def _default_file_compression():
+    prefs = _file_browser_preferences()
+    return bool(getattr(prefs, "use_file_compression", False)) if prefs else False
+
+
+def _default_relative_remap():
+    prefs = _file_browser_preferences()
+    return bool(getattr(prefs, "use_relative_paths", True)) if prefs else True
+
+
+def _open_mainfile_current_window(filepath, load_ui=True, use_scripts=False):
+    # The operator defaults mirror Blender's File Paths preferences, while the
+    # file browser panel can still override them for a single action.
     _remember_overlay_state(context=bpy.context)
     result = bpy.ops.wm.open_mainfile(
         "EXEC_DEFAULT",
         filepath=filepath,
-        load_ui=True,
+        load_ui=bool(load_ui),
+        use_scripts=bool(use_scripts),
         display_file_selector=False,
     )
     if _pending_overlay_state in OVERLAY_STATES:
@@ -2253,9 +2317,20 @@ class MBB_OT_open_blend_bookmark(bpy.types.Operator):
     bl_options = {"REGISTER"}
 
     filepath: StringProperty(name="File Path", subtype="FILE_PATH")
+    hide_props_region: BoolProperty(name="Hide Operator Properties", default=True, options={"HIDDEN"})
+    check_existing: BoolProperty(name="Check Existing", default=False, options={"HIDDEN"})
+    filter_blender: BoolProperty(name="Filter .blend files", default=True, options={"HIDDEN"})
+    filter_backup: BoolProperty(name="Filter backup .blend files", default=False, options={"HIDDEN"})
+    filter_folder: BoolProperty(name="Filter folders", default=True, options={"HIDDEN"})
+    filemode: IntProperty(name="File Browser Mode", default=8, options={"HIDDEN"})
+    load_ui: BoolProperty(name="Load UI", default=True)
+    use_scripts: BoolProperty(name="Trusted Source", default=False)
+    display_file_selector: BoolProperty(name="Display File Selector", default=True, options={"HIDDEN"})
     filter_glob: StringProperty(default="*.blend", options={"HIDDEN"})
 
     def invoke(self, context, _event):
+        self.load_ui = _default_load_ui()
+        self.use_scripts = _default_trusted_source()
         context.window_manager.fileselect_add(self)
         return {"RUNNING_MODAL"}
 
@@ -2273,7 +2348,7 @@ class MBB_OT_open_blend_bookmark(bpy.types.Operator):
         _upsert_registry_tab(filepath, _title_from_path(filepath), is_active=True)
         _sync_registry_to_properties(context)
         _set_single_selection_for_path(context, filepath)
-        return _open_mainfile_current_window(filepath)
+        return _open_mainfile_current_window(filepath, load_ui=self.load_ui, use_scripts=self.use_scripts)
 
 
 class MBB_OT_new_blend_bookmark(bpy.types.Operator):
@@ -2298,6 +2373,14 @@ class MBB_OT_save_original_project(bpy.types.Operator):
     bl_options = {"INTERNAL"}
 
     filepath: StringProperty(name="File Path", subtype="FILE_PATH")
+    hide_props_region: BoolProperty(name="Hide Operator Properties", default=True, options={"HIDDEN"})
+    check_existing: BoolProperty(name="Check Existing", default=True, options={"HIDDEN"})
+    filter_blender: BoolProperty(name="Filter .blend files", default=True, options={"HIDDEN"})
+    filter_backup: BoolProperty(name="Filter backup .blend files", default=False, options={"HIDDEN"})
+    filter_folder: BoolProperty(name="Filter folders", default=True, options={"HIDDEN"})
+    filemode: IntProperty(name="File Browser Mode", default=8, options={"HIDDEN"})
+    compress: BoolProperty(name="Compress", default=False)
+    relative_remap: BoolProperty(name="Remap Relative", default=True)
     filter_glob: StringProperty(default="*.blend", options={"HIDDEN"})
 
     @classmethod
@@ -2305,6 +2388,8 @@ class MBB_OT_save_original_project(bpy.types.Operator):
         return True
 
     def invoke(self, context, _event):
+        self.compress = _default_file_compression()
+        self.relative_remap = _default_relative_remap()
         current = _current_blend_filepath()
         tab = _find_tab_by_any_path(current) or _active_registry_tab()
         target = _manual_save_target_from_tab(tab, current)
@@ -2336,6 +2421,8 @@ class MBB_OT_save_original_project(bpy.types.Operator):
             filepath=filepath,
             copy=True,
             check_existing=False,
+            compress=bool(self.compress),
+            relative_remap=bool(self.relative_remap),
         )
 
         if old_original and old_original != filepath and (_is_cache_file_path(old_original) or _is_untitled_path(old_original)):
@@ -2373,6 +2460,8 @@ class MBB_OT_change_ui_color_menu(bpy.types.Operator):
             ("Plus button", "dock_plus_button_color"),
             ("Outline", "dock_outline_color"),
             ("Text", "dock_text_color"),
+            ("Tooltip Background", "tooltip_background_color"),
+            ("Tooltip Text", "tooltip_text_color"),
         ):
             layout.prop(prefs, prop_name, text=_t(label))
 
@@ -2380,7 +2469,7 @@ class MBB_OT_change_ui_color_menu(bpy.types.Operator):
         return {"FINISHED"}
 
     def invoke(self, context, _event):
-        return context.window_manager.invoke_popup(self, width=135)
+        return context.window_manager.invoke_popup(self, width=165)
 
 
 class MBB_OT_user_pref_menu(bpy.types.Operator):
@@ -2431,6 +2520,8 @@ class MBB_OT_reset_ui_colors(bpy.types.Operator):
             ("dock_plus_button_color", PLUS_BUTTON_COLOR),
             ("dock_outline_color", DOCK_OUTLINE_COLOR),
             ("dock_text_color", DOCK_TEXT_COLOR),
+            ("tooltip_background_color", TOOLTIP_BACKGROUND_COLOR),
+            ("tooltip_text_color", TOOLTIP_TEXT_COLOR),
         )
         for prop_name, value in defaults:
             setattr(prefs, prop_name, value)
@@ -2655,9 +2746,6 @@ class MBB_OT_dock_shortcut(bpy.types.Operator):
         return bpy.app.background or _shortcuts_are_global() or _mouse_over_any_dock()
 
     def execute(self, _context):
-        if self.target == "shortcut_open_file":
-            _remember_overlay_state(context=bpy.context)
-            return _execute_or_defer(lambda: bpy.ops.wm.mbb_open_blend("INVOKE_DEFAULT"))
         if self.target == "shortcut_new_file":
             _remember_overlay_state(context=bpy.context)
             return _execute_or_defer(lambda: bpy.ops.wm.mbb_new_blend())
@@ -3015,12 +3103,19 @@ def _wrap_text_to_width(text, size, max_width):
     return lines or [text]
 
 
+def _unsaved_file_label():
+    locale = str(getattr(bpy.app.translations, "locale", "") or "")
+    return "文件未保存" if locale.startswith("zh") else UNSAVED_FILE_LABEL
+
+
 def _tab_tooltip_lines(tab):
-    original_path = bpy.path.abspath(tab.get("filepath", "")) if tab.get("filepath", "") else ""
+    filepath = bpy.path.abspath(tab.get("filepath", "")) if tab.get("filepath", "") else ""
+    cache_filepath = bpy.path.abspath(tab.get("cache_filepath", "")) if tab.get("cache_filepath", "") else ""
+    original_path = "" if _is_untitled_path(filepath) or _is_cache_file_path(filepath) or (cache_filepath and filepath == cache_filepath) else filepath
     title = tab.get("title", "") or _title_from_path(original_path)
     if title.lower().endswith(".blend"):
         title = title[:-6]
-    return title or "Untitled", original_path or "Unsaved"
+    return title or "Untitled", _unsaved_file_label() if not original_path else original_path
 
 
 def _draw_tab_tooltip(tab, anchor_x, anchor_y, region_width, region_height):
@@ -3032,8 +3127,8 @@ def _draw_tab_tooltip(tab, anchor_x, anchor_y, region_width, region_height):
 
     scale = _dock_ui_scale()
     title, original_path = _tab_tooltip_lines(tab)
-    title_size = 14 * scale
-    path_size = 12 * scale
+    title_size = 16.8 * scale
+    path_size = 14.4 * scale
     padding_x = 14 * scale
     padding_y = 10 * scale
     gap = 5 * scale
@@ -3044,29 +3139,31 @@ def _draw_tab_tooltip(tab, anchor_x, anchor_y, region_width, region_height):
     path_lines = _wrap_text_to_width(original_path, path_size, max_content_w) if show_path else []
     title_h = _text_dimensions("Ag", title_size)[1]
     path_h = _text_dimensions("Ag", path_size)[1]
+    top_padding_y = padding_y
+    bottom_padding_y = padding_y + path_h * 0.4
     content_w = 0
     for line in title_lines:
         content_w = max(content_w, _text_dimensions(line, title_size)[0])
     for line in path_lines:
         content_w = max(content_w, _text_dimensions(line, path_size)[0])
 
-    box_w = content_w + padding_x * 2.0
-    box_h = padding_y * 2.0 + len(title_lines) * title_h + max(0, len(title_lines) - 1) * line_gap + len(path_lines) * path_h + max(0, len(path_lines) - 1) * line_gap
+    title_block_h = len(title_lines) * title_h + max(0, len(title_lines) - 1) * line_gap
+    path_block_h = len(path_lines) * path_h + max(0, len(path_lines) - 1) * line_gap
+    content_h = title_block_h + path_block_h
     if title_lines and path_lines:
-        box_h += gap
+        content_h += gap
+    box_w = content_w + padding_x * 2.0
+    box_h = top_padding_y + content_h + bottom_padding_y
     x = min(max(OVERLAY_MARGIN * scale, anchor_x), max(OVERLAY_MARGIN * scale, region_width - box_w - OVERLAY_MARGIN * scale))
-    y = anchor_y - box_h - (8 * scale)
+    y = anchor_y - box_h - ((8 * scale) + gap) * 2.0
     if y < OVERLAY_MARGIN * scale:
         y = min(region_height - box_h - OVERLAY_MARGIN * scale, anchor_y + (8 * scale))
 
-    _draw_soft_shadow(x, y, box_w, box_h, 10 * scale)
-    _draw_rounded_rect(x, y, box_w, box_h, 10 * scale, (0.96, 0.98, 1.0, 0.98))
-    _draw_rounded_rect_outline(x, y, box_w, box_h, 10 * scale, 1.0 * scale, _with_alpha(_dock_outline_color(), 0.88))
+    _draw_rounded_rect(x, y, box_w, box_h, 10 * scale, _tooltip_background_color())
 
     text_x = x + padding_x
-    first_line_h = title_h if title_lines else path_h
-    text_y = y + box_h - padding_y - first_line_h
-    title_color = _dock_text_color()
+    text_y = y + box_h - top_padding_y - (title_h if title_lines else path_h)
+    title_color = _tooltip_text_color()
     path_color = _with_alpha(title_color, title_color[3] * 0.76)
     for line in title_lines:
         _draw_text(line, text_x, text_y, title_size, title_color)
@@ -3836,6 +3933,12 @@ class MBB_OT_overlay_router(bpy.types.Operator):
 
 
 @persistent
+def _mbb_load_pre(_dummy):
+    _persist_overlay_state(bpy.context)
+    _remember_overlay_state(context=bpy.context)
+
+
+@persistent
 def _mbb_load_post(_dummy):
     global _overlay_router_running, _overlay_visibility_initialized
     _overlay_router_running = False
@@ -4046,6 +4149,8 @@ def register():
     _register_keymaps()
     _install_header_toggle()
 
+    if _mbb_load_pre not in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.append(_mbb_load_pre)
     if _mbb_load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_mbb_load_post)
     if _mbb_save_post not in bpy.app.handlers.save_post:
@@ -4068,6 +4173,8 @@ def unregister():
     _remove_overlay_draw_handler()
     _remove_header_toggle()
 
+    if _mbb_load_pre in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.remove(_mbb_load_pre)
     if _mbb_load_post in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_mbb_load_post)
     if _mbb_save_post in bpy.app.handlers.save_post:

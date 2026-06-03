@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 blender_version_min = "5.0.0"
-version = "0.6.9"
+version = "0.6.10"
 id = "Multi_Files_Bookmark"
 name = "Multi Files Bookmark"
 tagline = "Manage your projects as bookmarks in one Blender window"
