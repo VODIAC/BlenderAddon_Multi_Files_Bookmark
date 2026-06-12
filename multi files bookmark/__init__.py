@@ -1,6 +1,4 @@
-﻿# SPDX-License-Identifier: GPL-2.0-or-later
-#
-# Multi Files Bookmark
+﻿# Multi Files Bookmark
 #
 # Blender keeps one active .blend data-base per process. This add-on stays
 # inside the current Blender window and switches projects with open_mainfile().
@@ -8,20 +6,11 @@
 # user cache directory. Switching back opens that cache copy, so unsaved edits
 # survive without touching the original .blend file.
 
-bl_info = {
-    "name": "Multi Files Bookmark",
-    "author": "61+",
-    "version": (0, 6, 10),
-    "blender": (5, 0, 0),
-    "location": "3D View > Floating Top Tab Bar",
-    "description": "Manage blend project as bookmarks in one Blender window",
-    "category": "System",
-}
-
 import json
 import math
 import os
 import hashlib
+import shutil
 import tempfile
 import time
 import uuid
@@ -35,17 +24,20 @@ from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, FloatVectorProperty, IntProperty, StringProperty
 from gpu_extras.batch import batch_for_shader
 
-from .translation import TRANSLATIONS
+from .translation import TRANSLATIONS, theme_path_labels
 
 
 ADDON_ID = "multi_blender_bookmark"
 ADDON_MODULE = __package__
 CACHE_FOLDER_NAME = "Blender Bookmark"
 DEFAULT_CACHE_DIR = os.path.join(tempfile.gettempdir(), CACHE_FOLDER_NAME)
-REGISTRY_PATH = os.path.join(DEFAULT_CACHE_DIR, "multi_blender_bookmark.json")
+SESSION_ID = f"pid_{os.getpid()}"
+REGISTRY_PATH = os.path.join(DEFAULT_CACHE_DIR, f"multi_blender_bookmark_{SESSION_ID}.json")
 LEGACY_REGISTRY_PATH = os.path.join(tempfile.gettempdir(), "multi_blender_bookmark.json")
-LAST_CLOSED_PATH = os.path.join(DEFAULT_CACHE_DIR, "multi_blender_bookmark_last_closed.json")
+LAST_CLOSED_PATH = os.path.join(DEFAULT_CACHE_DIR, f"multi_blender_bookmark_last_closed_{SESSION_ID}.json")
 OVERLAY_STATE_PATH = os.path.join(DEFAULT_CACHE_DIR, "multi_blender_bookmark_overlay_state.json")
+UI_COLOR_PRESETS_FILENAME = "multi_blender_bookmark_ui_color_presets.json"
+UI_COLOR_PRESETS_LOCATION_FILENAME = "multi_blender_bookmark_ui_color_presets_location.json"
 
 MAX_BOOKMARK_LABEL_CHARS = 12
 OVERLAY_MARGIN = 14
@@ -83,6 +75,35 @@ DOCK_OUTLINE_COLOR = (1.0, 1.0, 1.0, 0.76)
 DOCK_TEXT_COLOR = (0.05, 0.06, 0.08, 0.96)
 TOOLTIP_BACKGROUND_COLOR = (0.96, 0.98, 1.0, 0.98)
 TOOLTIP_TEXT_COLOR = (0.05, 0.06, 0.08, 0.96)
+THEME_COLOR_DEFAULTS = {
+    "dock_inner_color": "user_interface.wcol_menu_back.inner",
+    "dock_selected_color": "user_interface.wcol_toolbar_item.inner",
+    "dock_tab_color": "properties.space.back",
+    "dock_button_color": "user_interface.wcol_pie_menu.inner_sel",
+    "dock_plus_button_color": "user_interface.wcol_num.inner",
+    "dock_outline_color": "user_interface.wcol_num.outline",
+    "dock_text_color": "user_interface.wcol_menu.text",
+    "tooltip_background_color": "user_interface.wcol_tooltip.inner",
+    "tooltip_text_color": "user_interface.wcol_radio.text",
+}
+UI_COLOR_THEME_PROPS = tuple(THEME_COLOR_DEFAULTS.keys())
+UI_COLOR_CUSTOM_DEFAULTS = {
+    "dock_inner_color": DOCK_INNER_COLOR,
+    "dock_selected_color": DOCK_SELECTED_COLOR,
+    "dock_tab_color": DOCK_TAB_COLOR,
+    "dock_button_color": ADD_BUTTON_BLUE,
+    "dock_plus_button_color": PLUS_BUTTON_COLOR,
+    "dock_outline_color": DOCK_OUTLINE_COLOR,
+    "dock_text_color": DOCK_TEXT_COLOR,
+    "tooltip_background_color": TOOLTIP_BACKGROUND_COLOR,
+    "tooltip_text_color": TOOLTIP_TEXT_COLOR,
+}
+_theme_color_entries = []
+_theme_color_entry_labels = {}
+_theme_color_menu_tree = {"label": "", "children": {}, "items": []}
+_theme_color_menu_nodes = {}
+_theme_color_item_nodes = {}
+_theme_color_dynamic_menu_classes = []
 
 addon_keymaps = []
 _overlay_draw_handler = None
@@ -101,6 +122,16 @@ _overlay_visibility_initialized = False
 _overlay_view_mode_state = "NAMES"
 _pending_overlay_state = ""
 _original_draw_xform_template = None
+_original_drop_blend_file_invoke = None
+_drop_blend_paths = []
+_drop_blend_deadline = 0.0
+_drop_blend_timer_running = False
+_theme_source_menu_target = ""
+_theme_source_menu_current_source = ""
+_theme_color_preview_target = ""
+_theme_color_preview_source = ""
+_theme_color_preview_deadline = 0.0
+_theme_color_preview_generation = 0
 _thumbnail_textures = {}
 _sdf_round_rect_shader = None
 _sdf_line_shader = None
@@ -698,6 +729,314 @@ def _redraw_dock_preferences(_self=None, context=None):
     _request_view3d_redraw(context)
 
 
+def _update_theme_color_mode(_self=None, context=None):
+    clear_preview = globals().get("_clear_theme_color_preview")
+    if clear_preview:
+        clear_preview()
+    _request_view3d_redraw(context)
+    try:
+        bpy.ops.wm.redraw_timer(type="DRAW_WIN_SWAP", iterations=1)
+    except Exception:
+        pass
+
+
+def _update_drop_panel_preference(_self=None, _context=None):
+    install = globals().get("_install_drop_blend_patch")
+    remove = globals().get("_remove_drop_blend_patch")
+    if not install or not remove:
+        return
+    if bool(getattr(_self, "use_plugin_drop_panel", True)):
+        install()
+    else:
+        remove()
+
+
+def _use_plugin_drop_panel():
+    prefs = _addon_preferences()
+    return not prefs or bool(getattr(prefs, "use_plugin_drop_panel", True))
+
+
+_applying_ui_color_preset = False
+
+
+def _ui_color_presets_path(cache_directory=None):
+    directory = bpy.path.abspath(cache_directory) if cache_directory else _cache_dir()
+    return os.path.join(directory, UI_COLOR_PRESETS_FILENAME)
+
+
+def _ui_color_presets_location_path():
+    return os.path.join(DEFAULT_CACHE_DIR, UI_COLOR_PRESETS_LOCATION_FILENAME)
+
+
+def _save_ui_color_presets_location(cache_directory):
+    directory = bpy.path.abspath(cache_directory or DEFAULT_CACHE_DIR)
+    try:
+        os.makedirs(DEFAULT_CACHE_DIR, exist_ok=True)
+        with open(_ui_color_presets_location_path(), "w", encoding="utf-8") as handle:
+            json.dump({"version": 1, "cache_directory": directory}, handle, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+def _load_ui_color_presets_location():
+    path = _ui_color_presets_location_path()
+    if not os.path.exists(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return ""
+    directory = data.get("cache_directory", "") if isinstance(data, dict) else ""
+    return bpy.path.abspath(directory) if directory else ""
+
+
+def _new_preset_id():
+    return uuid.uuid4().hex
+
+
+def _unique_ui_color_preset_name(prefs, base="Default"):
+    existing = {preset.name for preset in getattr(prefs, "ui_color_presets", ())}
+    if base not in existing:
+        return base
+    index = 2
+    while f"{base} {index}" in existing:
+        index += 1
+    return f"{base} {index}"
+
+
+def _store_ui_color_preset_from_prefs(preset, prefs, name=None):
+    if name is not None:
+        preset.name = name
+    if not getattr(preset, "preset_id", ""):
+        preset.preset_id = _new_preset_id()
+    preset.use_theme_colors = bool(getattr(prefs, "use_theme_colors", True))
+    for prop_name in UI_COLOR_THEME_PROPS:
+        color_prop = f"{prop_name}_color_value"
+        source_prop = f"{prop_name}_theme_source"
+        if hasattr(preset, color_prop):
+            setattr(preset, color_prop, getattr(prefs, prop_name))
+        if hasattr(preset, source_prop) and hasattr(prefs, source_prop):
+            setattr(preset, source_prop, getattr(prefs, source_prop))
+
+
+def _ui_color_preset_to_dict(preset):
+    data = {
+        "id": getattr(preset, "preset_id", "") or _new_preset_id(),
+        "name": getattr(preset, "name", "") or "Default",
+        "use_theme_colors": bool(getattr(preset, "use_theme_colors", True)),
+        "colors": {},
+        "theme_sources": {},
+    }
+    for prop_name in UI_COLOR_THEME_PROPS:
+        color_prop = f"{prop_name}_color_value"
+        source_prop = f"{prop_name}_theme_source"
+        if hasattr(preset, color_prop):
+            data["colors"][prop_name] = list(getattr(preset, color_prop))
+        if hasattr(preset, source_prop):
+            data["theme_sources"][prop_name] = getattr(preset, source_prop)
+    return data
+
+
+def _store_ui_color_preset_from_dict(preset, data):
+    preset.preset_id = str(data.get("id") or _new_preset_id())
+    preset.name = str(data.get("name") or "Default")
+    preset.use_theme_colors = bool(data.get("use_theme_colors", True))
+    colors = data.get("colors", {}) if isinstance(data.get("colors", {}), dict) else {}
+    sources = data.get("theme_sources", {}) if isinstance(data.get("theme_sources", {}), dict) else {}
+    for prop_name, value in UI_COLOR_CUSTOM_DEFAULTS.items():
+        color_prop = f"{prop_name}_color_value"
+        source_prop = f"{prop_name}_theme_source"
+        if hasattr(preset, color_prop):
+            setattr(preset, color_prop, colors.get(prop_name, value))
+        if hasattr(preset, source_prop):
+            setattr(preset, source_prop, sources.get(prop_name, THEME_COLOR_DEFAULTS.get(prop_name, "")))
+
+
+def _save_ui_color_presets_to_disk(prefs):
+    if not prefs:
+        return
+    path = _ui_color_presets_path(getattr(prefs, "cache_directory", ""))
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        data = {
+            "version": 1,
+            "active": getattr(prefs, "active_ui_color_preset", ""),
+            "presets": [_ui_color_preset_to_dict(preset) for preset in prefs.ui_color_presets],
+        }
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+        prefs.ui_color_presets_cache_directory = bpy.path.abspath(getattr(prefs, "cache_directory", "") or DEFAULT_CACHE_DIR)
+        _save_ui_color_presets_location(prefs.ui_color_presets_cache_directory)
+    except OSError:
+        pass
+
+
+def _load_ui_color_presets_from_disk(prefs):
+    if not prefs:
+        return False
+    cache_directory = bpy.path.abspath(getattr(prefs, "cache_directory", "") or DEFAULT_CACHE_DIR)
+    path = _ui_color_presets_path(cache_directory)
+    if not os.path.exists(path):
+        located_directory = _load_ui_color_presets_location()
+        located_path = _ui_color_presets_path(located_directory) if located_directory else ""
+        if located_path and os.path.exists(located_path):
+            cache_directory = located_directory
+            path = located_path
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return False
+    presets_data = data.get("presets", [])
+    if not isinstance(presets_data, list) or not presets_data:
+        return False
+    prefs.ui_color_presets.clear()
+    for preset_data in presets_data:
+        if not isinstance(preset_data, dict):
+            continue
+        preset = prefs.ui_color_presets.add()
+        _store_ui_color_preset_from_dict(preset, preset_data)
+    if not prefs.ui_color_presets:
+        return False
+    active = str(data.get("active") or "")
+    _index, preset = _find_ui_color_preset(prefs, active)
+    if not preset:
+        preset = prefs.ui_color_presets[0]
+    global _applying_ui_color_preset
+    _applying_ui_color_preset = True
+    try:
+        prefs.active_ui_color_preset = preset.preset_id
+    finally:
+        _applying_ui_color_preset = False
+    _apply_ui_color_preset(prefs, preset)
+    if os.path.normcase(os.path.abspath(cache_directory)) != os.path.normcase(
+        os.path.abspath(getattr(prefs, "cache_directory", "") or DEFAULT_CACHE_DIR)
+    ):
+        prefs.cache_directory = cache_directory
+    prefs.ui_color_presets_cache_directory = cache_directory
+    _save_ui_color_presets_location(cache_directory)
+    return True
+
+
+def _store_default_ui_color_preset(preset):
+    preset.name = "Default"
+    if not getattr(preset, "preset_id", ""):
+        preset.preset_id = _new_preset_id()
+    preset.use_theme_colors = True
+    for prop_name, value in UI_COLOR_CUSTOM_DEFAULTS.items():
+        color_prop = f"{prop_name}_color_value"
+        if hasattr(preset, color_prop):
+            setattr(preset, color_prop, value)
+    for prop_name, value in THEME_COLOR_DEFAULTS.items():
+        source_prop = f"{prop_name}_theme_source"
+        if hasattr(preset, source_prop):
+            setattr(preset, source_prop, value)
+
+
+def _find_ui_color_preset(prefs, preset_id):
+    for index, preset in enumerate(getattr(prefs, "ui_color_presets", ())):
+        if preset.preset_id == preset_id:
+            return index, preset
+    return -1, None
+
+
+def _ensure_ui_color_presets(prefs):
+    global _applying_ui_color_preset
+    if not prefs:
+        return None
+    presets = prefs.ui_color_presets
+    if not presets:
+        if _load_ui_color_presets_from_disk(prefs):
+            return _find_ui_color_preset(prefs, getattr(prefs, "active_ui_color_preset", ""))[1] or prefs.ui_color_presets[0]
+        preset = presets.add()
+        _store_ui_color_preset_from_prefs(preset, prefs, "Default")
+        _applying_ui_color_preset = True
+        try:
+            prefs.active_ui_color_preset = preset.preset_id
+        finally:
+            _applying_ui_color_preset = False
+        _save_ui_color_presets_to_disk(prefs)
+        return preset
+    for preset in presets:
+        if not preset.preset_id:
+            preset.preset_id = _new_preset_id()
+    prefs.ui_color_presets_cache_directory = bpy.path.abspath(getattr(prefs, "cache_directory", "") or DEFAULT_CACHE_DIR)
+    _index, preset = _find_ui_color_preset(prefs, getattr(prefs, "active_ui_color_preset", ""))
+    if preset:
+        return preset
+    preset = presets[0]
+    _applying_ui_color_preset = True
+    try:
+        prefs.active_ui_color_preset = preset.preset_id
+    finally:
+        _applying_ui_color_preset = False
+    return preset
+
+
+def _apply_ui_color_preset(prefs, preset, context=None):
+    global _applying_ui_color_preset
+    if not prefs or not preset:
+        return
+    _applying_ui_color_preset = True
+    try:
+        prefs.use_theme_colors = bool(preset.use_theme_colors)
+        for prop_name in UI_COLOR_THEME_PROPS:
+            color_prop = f"{prop_name}_color_value"
+            source_prop = f"{prop_name}_theme_source"
+            if hasattr(preset, color_prop):
+                setattr(prefs, prop_name, getattr(preset, color_prop))
+            if hasattr(preset, source_prop) and hasattr(prefs, source_prop):
+                setattr(prefs, source_prop, getattr(preset, source_prop))
+    finally:
+        _applying_ui_color_preset = False
+    clear_preview = globals().get("_clear_theme_color_preview")
+    if clear_preview:
+        clear_preview()
+    _request_view3d_redraw(context)
+
+
+def _ui_color_preset_items(self, _context):
+    presets = getattr(self, "ui_color_presets", None)
+    if not presets:
+        return [("default", "Default", "Default plugin UI color preset")]
+    return [
+        (preset.preset_id or f"preset_{index}", preset.name or "Default", "")
+        for index, preset in enumerate(presets)
+    ]
+
+
+def _update_active_ui_color_preset(self, context=None):
+    if _applying_ui_color_preset:
+        return
+    _ensure_ui_color_presets(self)
+    _index, preset = _find_ui_color_preset(self, getattr(self, "active_ui_color_preset", ""))
+    if preset:
+        _apply_ui_color_preset(self, preset, context)
+
+
+def _update_cache_directory(self, _context=None):
+    old_dir = bpy.path.abspath(getattr(self, "ui_color_presets_cache_directory", "") or DEFAULT_CACHE_DIR)
+    new_dir = bpy.path.abspath(getattr(self, "cache_directory", "") or DEFAULT_CACHE_DIR)
+    old_path = _ui_color_presets_path(old_dir)
+    new_path = _ui_color_presets_path(new_dir)
+    if os.path.normcase(os.path.abspath(old_path)) != os.path.normcase(os.path.abspath(new_path)):
+        try:
+            os.makedirs(os.path.dirname(new_path), exist_ok=True)
+            if os.path.exists(old_path):
+                if os.path.exists(new_path):
+                    os.remove(new_path)
+                shutil.move(old_path, new_path)
+            else:
+                _save_ui_color_presets_to_disk(self)
+        except (OSError, shutil.Error):
+            _save_ui_color_presets_to_disk(self)
+    self.ui_color_presets_cache_directory = new_dir
+    _save_ui_color_presets_location(new_dir)
+
+
 def _request_view3d_redraw(context=None):
     _tag_view3d_redraw(context)
     try:
@@ -1148,15 +1487,10 @@ def _capture_current_thumbnail(filepath, force=False):
 
 
 def _read_registry():
-    data = None
-    for path in (REGISTRY_PATH, LEGACY_REGISTRY_PATH):
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                data = json.load(handle)
-            break
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            continue
-    if data is None:
+    try:
+        with open(REGISTRY_PATH, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {"tabs": []}
 
     tabs = data.get("tabs")
@@ -1189,6 +1523,42 @@ def _write_tabs_file(path, data):
     with open(temp_path, "w", encoding="utf-8") as handle:
         json.dump(safe_data, handle, ensure_ascii=False, indent=2)
     os.replace(temp_path, path)
+
+
+def _registry_history_paths():
+    paths = []
+    try:
+        for name in os.listdir(DEFAULT_CACHE_DIR):
+            if name.startswith("multi_blender_bookmark") and name.endswith(".json") and "overlay_state" not in name and "last_closed" not in name:
+                paths.append(os.path.join(DEFAULT_CACHE_DIR, name))
+    except OSError:
+        pass
+    paths.extend([REGISTRY_PATH, LEGACY_REGISTRY_PATH])
+    unique = []
+    seen = set()
+    for path in paths:
+        key = os.path.normcase(os.path.abspath(path))
+        if key in seen or not os.path.exists(path):
+            continue
+        seen.add(key)
+        unique.append(path)
+    return sorted(unique, key=lambda path: os.path.getmtime(path), reverse=True)
+
+
+def _latest_original_tab_for_cache(cache_filepath):
+    cache_filepath = bpy.path.abspath(cache_filepath) if cache_filepath else ""
+    if not cache_filepath:
+        return None
+    for path in _registry_history_paths():
+        for tab in _read_tabs_file(path)["tabs"]:
+            tab_cache = bpy.path.abspath(tab.get("cache_filepath", "")) if tab.get("cache_filepath", "") else ""
+            tab_file = bpy.path.abspath(tab.get("filepath", "")) if tab.get("filepath", "") else ""
+            if tab_cache != cache_filepath and tab_file != cache_filepath:
+                continue
+            if not tab_file or tab_file == cache_filepath or _is_cache_file_path(tab_file) or _is_untitled_path(tab_file):
+                continue
+            return tab
+    return None
 
 
 def _tab_key(tab):
@@ -1269,6 +1639,36 @@ def _current_ui_state_hash(context=None):
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _is_missing_autopack_error(error):
+    message = str(error).lower()
+    return (
+        ("pack" in message or "\u6253\u5305" in message)
+        and (
+            "source" in message
+            or "\u6e90\u8def\u5f84" in message
+            or "\u627e\u4e0d\u5230" in message
+            or "not found" in message
+        )
+    )
+
+
+def _save_as_mainfile_resilient(*args, **kwargs):
+    try:
+        return bpy.ops.wm.save_as_mainfile(*args, **kwargs)
+    except RuntimeError as exc:
+        if not _is_missing_autopack_error(exc):
+            raise
+        old_autopack = bool(getattr(bpy.data, "use_autopack", False))
+        if not old_autopack:
+            raise
+        print(f"Multi Blender Bookmark: retrying save without auto-pack because a source file is missing: {exc}")
+        try:
+            bpy.data.use_autopack = False
+            return bpy.ops.wm.save_as_mainfile(*args, **kwargs)
+        finally:
+            bpy.data.use_autopack = old_autopack
+
+
 def _store_last_closed_tabs(tabs):
     global _last_closed_tabs, _closed_tab_history
     _last_closed_tabs = [_clean_registry({"tabs": [tab]})["tabs"][0] for tab in tabs if tab.get("filepath")]
@@ -1285,21 +1685,33 @@ def _initialize_new_window_session(context=None):
     _startup_session_initialized = True
     _last_closed_tabs = []
     _closed_tab_history = []
+    if _clean_registry(_read_registry())["tabs"]:
+        _register_current_process_tab(is_active=True)
+        _sync_registry_to_properties(context or bpy.context)
+        return
+
     current = _current_blend_filepath()
     if not current:
         current = _first_window_untitled_cache_path()
         try:
-            bpy.ops.wm.save_as_mainfile("EXEC_DEFAULT", filepath=current, copy=False, check_existing=False)
+            _save_as_mainfile_resilient("EXEC_DEFAULT", filepath=current, copy=False, check_existing=False)
         except Exception:
             current = ""
     if current:
+        current = bpy.path.abspath(current)
+        original_tab = _latest_original_tab_for_cache(current) if _is_cache_file_path(current) else None
+        filepath = bpy.path.abspath(original_tab.get("filepath", "")) if original_tab else current
+        cache_filepath = current if original_tab else current
+        tab_id = original_tab.get("tab_id", "") if original_tab else ""
+        thumbnail_filepath = original_tab.get("thumbnail_filepath", "") if original_tab else ""
+        thumbnail_placeholder = bool(original_tab.get("thumbnail_placeholder", False)) if original_tab else _is_untitled_path(current)
         _write_registry({"tabs": [{
-            "tab_id": _new_tab_id() if _is_untitled_path(current) else _stable_tab_id_for_paths(current, current),
-            "filepath": bpy.path.abspath(current),
-            "cache_filepath": bpy.path.abspath(current),
-            "thumbnail_filepath": "",
-            "thumbnail_placeholder": _is_untitled_path(current),
-            "title": _title_from_path(current),
+            "tab_id": tab_id or (_new_tab_id() if _is_untitled_path(filepath) else _stable_tab_id_for_paths(filepath, cache_filepath)),
+            "filepath": filepath,
+            "cache_filepath": cache_filepath,
+            "thumbnail_filepath": thumbnail_filepath,
+            "thumbnail_placeholder": thumbnail_placeholder,
+            "title": _title_from_path(filepath),
             "is_active": True,
             "updated_at": _now(),
             "ui_state_hash": _current_ui_state_hash(context or bpy.context),
@@ -1458,6 +1870,27 @@ def _active_registry_tab():
     return None
 
 
+def _tab_matches_filepath(tab, filepath):
+    target = bpy.path.abspath(filepath) if filepath else ""
+    if not tab or not target:
+        return False
+    for path in (tab.get("filepath", ""), tab.get("cache_filepath", "")):
+        if path and bpy.path.abspath(path) == target:
+            return True
+    return False
+
+
+def _current_registry_tab(current=""):
+    current = bpy.path.abspath(current or _current_blend_filepath()) if (current or _current_blend_filepath()) else ""
+    tab = _find_tab_by_any_path(current) if current else None
+    if tab:
+        return tab
+    active_tab = _active_registry_tab()
+    if _tab_matches_filepath(active_tab, current):
+        return active_tab
+    return None
+
+
 def _next_untitled_cache_path():
     data = _clean_registry(_read_registry())
     used = set()
@@ -1519,7 +1952,7 @@ def _save_current_project_to_cache(force=False, capture_thumbnail=False):
 
     # copy=True keeps bpy.data.filepath pointing at the current file/cache. It
     # writes an overwriteable cache copy without changing the user's original.
-    bpy.ops.wm.save_as_mainfile(
+    _save_as_mainfile_resilient(
         "EXEC_DEFAULT",
         filepath=cache_path,
         copy=True,
@@ -1545,12 +1978,12 @@ def _bookmark_target_path_from_tab(tab):
     return bpy.path.abspath(tab.get("filepath", ""))
 
 
-def _open_registry_tab(tab):
+def _open_registry_tab(tab, load_ui=True, use_scripts=False):
     target = _bookmark_target_path_from_tab(tab)
     if not target or not os.path.exists(target):
         return {"CANCELLED"}
     _set_active_in_registry(tab["filepath"])
-    return _open_mainfile_current_window(target)
+    return _open_mainfile_current_window(target, load_ui=load_ui, use_scripts=use_scripts)
 
 
 def _next_remaining_tab_after_close(tabs, closing_indices, active_index):
@@ -1601,7 +2034,7 @@ def _create_untitled_bookmark(context=None, save_current=True):
         use_splash=False,
         use_empty=False,
     )
-    bpy.ops.wm.save_as_mainfile(
+    _save_as_mainfile_resilient(
         "EXEC_DEFAULT",
         filepath=cache_path,
         copy=False,
@@ -1700,6 +2133,30 @@ class MBB_BookmarkItem(bpy.types.PropertyGroup):
     )
 
 
+class MBB_UIColorPreset(bpy.types.PropertyGroup):
+    preset_id: StringProperty(options={"HIDDEN"})
+    name: StringProperty(name="Name", default="Default")
+    use_theme_colors: BoolProperty(default=True)
+    dock_inner_color_color_value: FloatVectorProperty(subtype="COLOR", size=4, min=0.0, max=1.0, default=DOCK_INNER_COLOR)
+    dock_selected_color_color_value: FloatVectorProperty(subtype="COLOR", size=4, min=0.0, max=1.0, default=DOCK_SELECTED_COLOR)
+    dock_tab_color_color_value: FloatVectorProperty(subtype="COLOR", size=4, min=0.0, max=1.0, default=DOCK_TAB_COLOR)
+    dock_button_color_color_value: FloatVectorProperty(subtype="COLOR", size=4, min=0.0, max=1.0, default=ADD_BUTTON_BLUE)
+    dock_plus_button_color_color_value: FloatVectorProperty(subtype="COLOR", size=4, min=0.0, max=1.0, default=PLUS_BUTTON_COLOR)
+    dock_outline_color_color_value: FloatVectorProperty(subtype="COLOR", size=4, min=0.0, max=1.0, default=DOCK_OUTLINE_COLOR)
+    dock_text_color_color_value: FloatVectorProperty(subtype="COLOR", size=4, min=0.0, max=1.0, default=DOCK_TEXT_COLOR)
+    tooltip_background_color_color_value: FloatVectorProperty(subtype="COLOR", size=4, min=0.0, max=1.0, default=TOOLTIP_BACKGROUND_COLOR)
+    tooltip_text_color_color_value: FloatVectorProperty(subtype="COLOR", size=4, min=0.0, max=1.0, default=TOOLTIP_TEXT_COLOR)
+    dock_inner_color_theme_source: StringProperty(default=THEME_COLOR_DEFAULTS["dock_inner_color"])
+    dock_selected_color_theme_source: StringProperty(default=THEME_COLOR_DEFAULTS["dock_selected_color"])
+    dock_tab_color_theme_source: StringProperty(default=THEME_COLOR_DEFAULTS["dock_tab_color"])
+    dock_button_color_theme_source: StringProperty(default=THEME_COLOR_DEFAULTS["dock_button_color"])
+    dock_plus_button_color_theme_source: StringProperty(default=THEME_COLOR_DEFAULTS["dock_plus_button_color"])
+    dock_outline_color_theme_source: StringProperty(default=THEME_COLOR_DEFAULTS["dock_outline_color"])
+    dock_text_color_theme_source: StringProperty(default=THEME_COLOR_DEFAULTS["dock_text_color"])
+    tooltip_background_color_theme_source: StringProperty(default=THEME_COLOR_DEFAULTS["tooltip_background_color"])
+    tooltip_text_color_theme_source: StringProperty(default=THEME_COLOR_DEFAULTS["tooltip_text_color"])
+
+
 class MBB_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = ADDON_MODULE
 
@@ -1717,6 +2174,12 @@ class MBB_AddonPreferences(bpy.types.AddonPreferences):
         min=0.1,
         max=1.5,
         precision=2,
+    )
+    use_theme_colors: BoolProperty(
+        name="Read Theme File",
+        description="Read UI colors from the current Blender theme instead of using custom color swatches",
+        default=True,
+        update=_update_theme_color_mode,
     )
     dock_inner_color: FloatVectorProperty(
         name="Panel",
@@ -1808,12 +2271,30 @@ class MBB_AddonPreferences(bpy.types.AddonPreferences):
         default=TOOLTIP_TEXT_COLOR,
         update=_redraw_dock_preferences,
     )
+    dock_inner_color_theme_source: StringProperty(default=THEME_COLOR_DEFAULTS["dock_inner_color"])
+    dock_selected_color_theme_source: StringProperty(default=THEME_COLOR_DEFAULTS["dock_selected_color"])
+    dock_tab_color_theme_source: StringProperty(default=THEME_COLOR_DEFAULTS["dock_tab_color"])
+    dock_button_color_theme_source: StringProperty(default=THEME_COLOR_DEFAULTS["dock_button_color"])
+    dock_plus_button_color_theme_source: StringProperty(default=THEME_COLOR_DEFAULTS["dock_plus_button_color"])
+    dock_outline_color_theme_source: StringProperty(default=THEME_COLOR_DEFAULTS["dock_outline_color"])
+    dock_text_color_theme_source: StringProperty(default=THEME_COLOR_DEFAULTS["dock_text_color"])
+    tooltip_background_color_theme_source: StringProperty(default=THEME_COLOR_DEFAULTS["tooltip_background_color"])
+    tooltip_text_color_theme_source: StringProperty(default=THEME_COLOR_DEFAULTS["tooltip_text_color"])
+    ui_color_presets: CollectionProperty(type=MBB_UIColorPreset)
+    active_ui_color_preset: EnumProperty(
+        name="UI Color Preset",
+        description="Switch between saved plugin UI color presets",
+        items=_ui_color_preset_items,
+        update=_update_active_ui_color_preset,
+    )
     cache_directory: StringProperty(
         name="Cache Folder",
         description="Folder for cached .blend files and bookmark thumbnails",
         default=DEFAULT_CACHE_DIR,
         subtype="DIR_PATH",
+        update=_update_cache_directory,
     )
+    ui_color_presets_cache_directory: StringProperty(default=DEFAULT_CACHE_DIR, options={"HIDDEN"})
     shortcut_scope: EnumProperty(
         name="Keymap Scope",
         description="Choose whether bookmark shortcuts work everywhere or only while the mouse is over the dock",
@@ -1832,6 +2313,12 @@ class MBB_AddonPreferences(bpy.types.AddonPreferences):
         name="Show File Path on Hover",
         description="Show the original file path while hovering a bookmark tab",
         default=True,
+    )
+    use_plugin_drop_panel: BoolProperty(
+        name="Use Plugin Panel When Dropping Files Into Blender to Support Multiple Files",
+        description="Use the plugin confirmation panel when dropping .blend files into Blender to support multiple files",
+        default=True,
+        update=_update_drop_panel_preference,
     )
 
     def draw(self, context):
@@ -2128,9 +2615,205 @@ def _clamp_color(color, fallback):
     return tuple(max(0.0, min(1.0, float(value))) for value in values[:4])
 
 
+def _is_theme_color_property(prop):
+    return (
+        getattr(prop, "type", None) == "FLOAT"
+        and str(getattr(prop, "subtype", "")).startswith("COLOR")
+        and getattr(prop, "array_length", 0) in (3, 4)
+    )
+
+
+def _theme_path_part(value, part):
+    if "[" not in part:
+        return getattr(value, part)
+    attr, rest = part.split("[", 1)
+    index_text = rest.split("]", 1)[0]
+    return getattr(value, attr)[int(index_text)]
+
+
+def _theme_path_identifier(part):
+    return part.split("[", 1)[0]
+
+
+def _srgb_channel_to_linear(value):
+    value = max(0.0, min(1.0, float(value)))
+    if value <= 0.04045:
+        return value / 12.92
+    return ((value + 0.055) / 1.055) ** 2.4
+
+
+def _theme_color_for_drawing(color, prop):
+    values = _clamp_color(color, (0.0, 0.0, 0.0, 1.0))
+    if str(getattr(prop, "subtype", "")).startswith("COLOR_GAMMA"):
+        return (
+            _srgb_channel_to_linear(values[0]),
+            _srgb_channel_to_linear(values[1]),
+            _srgb_channel_to_linear(values[2]),
+            values[3],
+        )
+    return values
+
+
+def _theme_color_display_label(label):
+    text = str(label or "")
+    for suffix in (" Widget Colors", " Colors"):
+        if text.endswith(suffix):
+            return text[:-len(suffix)]
+    return text
+
+
+def _theme_color_from_path(path, fallback):
+    try:
+        value = bpy.context.preferences.themes[0]
+        parts = [part for part in str(path or "").split(".") if part]
+        for part in parts[:-1]:
+            value = _theme_path_part(value, part)
+        if not parts:
+            return fallback
+        prop = value.bl_rna.properties[_theme_path_identifier(parts[-1])]
+        value = _theme_path_part(value, parts[-1])
+        if _is_theme_color_property(prop):
+            return _theme_color_for_drawing(value, prop)
+        return _clamp_color(value, fallback)
+    except Exception:
+        return fallback
+
+
+def _theme_color_raw_from_path(path, fallback):
+    try:
+        value = bpy.context.preferences.themes[0]
+        for part in str(path or "").split("."):
+            if not part:
+                continue
+            value = _theme_path_part(value, part)
+        return _clamp_color(value, fallback)
+    except Exception:
+        return fallback
+
+
+def _walk_theme_color_entries(obj, path="", labels=(), depth=0):
+    if depth > 8:
+        return []
+    entries = []
+    for prop in obj.bl_rna.properties:
+        identifier = prop.identifier
+        if identifier == "rna_type":
+            continue
+        try:
+            value = getattr(obj, identifier)
+        except Exception:
+            continue
+        label = _theme_color_display_label(prop.name or identifier)
+        next_path = f"{path}.{identifier}" if path else identifier
+        next_labels = labels + (label,)
+        if _is_theme_color_property(prop):
+            entries.append((next_path, next_labels))
+        elif prop.type == "POINTER":
+            entries.extend(_walk_theme_color_entries(value, next_path, next_labels, depth + 1))
+        elif prop.type == "COLLECTION":
+            try:
+                count = len(value)
+            except Exception:
+                count = 0
+            for index in range(count):
+                item = value[index]
+                item_label = getattr(item, "name", "") or str(index + 1)
+                entries.extend(
+                    _walk_theme_color_entries(
+                        item,
+                        f"{next_path}[{index}]",
+                        next_labels + (item_label,),
+                        depth + 1,
+                    )
+                )
+    return entries
+
+
+def _theme_source_leaf_label(labels):
+    return labels[-1] if labels else ""
+
+
+def _build_theme_color_data():
+    global _theme_color_entries, _theme_color_entry_labels, _theme_color_menu_tree, _theme_color_menu_nodes, _theme_color_item_nodes
+    try:
+        theme = bpy.context.preferences.themes[0]
+        scanned_entries = _walk_theme_color_entries(theme)
+    except Exception:
+        scanned_entries = []
+    _theme_color_entries = scanned_entries
+    label_entries = []
+    for path, fallback_labels in scanned_entries:
+        labels = theme_path_labels(path, fallback_labels)
+        label_entries.append((path, tuple(labels)))
+    _theme_color_entry_labels = {path: labels for path, labels in label_entries}
+    root = {"label": "", "children": {}, "items": []}
+    for path, labels in label_entries:
+        if not labels:
+            continue
+        node = root
+        for label in labels[:-1]:
+            node = node["children"].setdefault(label, {"label": label, "children": {}, "items": []})
+        node["items"].append((path, _theme_source_leaf_label(labels)))
+    _theme_color_menu_tree = root
+    nodes = {}
+
+    def collect(node):
+        node_id = len(nodes)
+        nodes[node_id] = node
+        for child in node["children"].values():
+            collect(child)
+        return node_id
+
+    collect(root)
+    _theme_color_menu_nodes = nodes
+    _theme_color_item_nodes = {
+        path: node_id
+        for node_id, node in nodes.items()
+        for path, _label in node.get("items", ())
+    }
+
+
+def _theme_source_menu_text(text):
+    return _t(str(text or ""))
+
+
+def _theme_source_label(path):
+    labels = _theme_color_entry_labels.get(path)
+    if labels:
+        return " > ".join(_theme_source_menu_text(label) for label in labels)
+    return str(path or "")
+
+
+def _clear_theme_color_preview():
+    global _theme_color_preview_target, _theme_color_preview_source, _theme_color_preview_deadline, _theme_color_preview_generation
+    _theme_color_preview_target = ""
+    _theme_color_preview_source = ""
+    _theme_color_preview_deadline = 0.0
+    _theme_color_preview_generation += 1
+    _request_view3d_redraw()
+    return None
+
+
+def _preview_theme_color(target, source_path):
+    global _theme_color_preview_target, _theme_color_preview_source, _theme_color_preview_deadline, _theme_color_preview_generation
+    _theme_color_preview_target = str(target or "")
+    _theme_color_preview_source = str(source_path or "")
+    _theme_color_preview_deadline = 0.0
+    _theme_color_preview_generation += 1
+    _request_view3d_redraw()
+
+
 def _dock_color(prop_name, fallback):
+    if (
+        _theme_color_preview_target == prop_name
+        and _theme_color_preview_source
+    ):
+        return _theme_color_from_path(_theme_color_preview_source, fallback)
     prefs = _addon_preferences()
     if prefs and hasattr(prefs, prop_name):
+        source_prop = f"{prop_name}_theme_source"
+        if bool(getattr(prefs, "use_theme_colors", True)) and hasattr(prefs, source_prop):
+            return _theme_color_from_path(getattr(prefs, source_prop), fallback)
         return _clamp_color(getattr(prefs, prop_name), fallback)
     return fallback
 
@@ -2300,7 +2983,11 @@ def _restore_closed_impl(context):
     _write_registry(data)
     _sync_registry_to_properties(context)
     _set_single_selection(len(data["tabs"]) - 1)
-    return _open_registry_tab(active_tab)
+    return _open_registry_tab(
+        active_tab,
+        load_ui=_default_load_ui(),
+        use_scripts=_default_trusted_source(),
+    )
 
 
 def _execute_or_defer(action):
@@ -2310,6 +2997,133 @@ def _execute_or_defer(action):
     return {"FINISHED"}
 
 
+def _blend_paths_from_operator(operator):
+    paths = []
+    directory = bpy.path.abspath(getattr(operator, "directory", "") or "")
+    files = getattr(operator, "files", None)
+    if files:
+        for item in files:
+            name = getattr(item, "name", "")
+            if not name:
+                continue
+            paths.append(bpy.path.abspath(os.path.join(directory, name)) if directory else bpy.path.abspath(name))
+    filepath = getattr(operator, "filepath", "") or ""
+    if filepath:
+        paths.append(bpy.path.abspath(filepath))
+
+    clean_paths = []
+    seen = set()
+    for path in paths:
+        key = os.path.normcase(bpy.path.abspath(path))
+        if key in seen or not path.lower().endswith(".blend"):
+            continue
+        seen.add(key)
+        clean_paths.append(bpy.path.abspath(path))
+    return clean_paths
+
+
+def _open_blend_bookmark_paths(context, filepaths, load_ui=True, use_scripts=False):
+    valid_paths = []
+    seen = set()
+    for filepath in filepaths:
+        path = bpy.path.abspath(filepath) if filepath else ""
+        key = os.path.normcase(path)
+        if not path or key in seen or not path.lower().endswith(".blend") or not os.path.exists(path):
+            continue
+        seen.add(key)
+        valid_paths.append(path)
+    if not valid_paths:
+        return {"CANCELLED"}
+
+    active_path = valid_paths[-1]
+    _remember_overlay_state(context=context)
+    _save_current_project_to_cache(capture_thumbnail=True)
+    for path in valid_paths:
+        _upsert_registry_tab(path, _title_from_path(path), is_active=(path == active_path))
+    _sync_registry_to_properties(context)
+    _set_single_selection_for_path(context, active_path)
+    return _open_mainfile_current_window(active_path, load_ui=load_ui, use_scripts=use_scripts)
+
+
+def _flush_dropped_blend_paths():
+    global _drop_blend_paths, _drop_blend_timer_running
+    if _now() < _drop_blend_deadline:
+        return max(0.02, _drop_blend_deadline - _now())
+    paths = list(_drop_blend_paths)
+    _drop_blend_paths = []
+    _drop_blend_timer_running = False
+    if paths:
+        if bpy.app.background:
+            _open_blend_bookmark_paths(
+                bpy.context,
+                paths,
+                load_ui=_default_load_ui(),
+                use_scripts=_default_trusted_source(),
+            )
+        else:
+            bpy.ops.wm.mbb_confirm_dropped_blends("INVOKE_DEFAULT", paths=json.dumps(paths))
+    return None
+
+
+def _queue_dropped_blend_paths(filepaths):
+    global _drop_blend_deadline, _drop_blend_timer_running
+    for filepath in filepaths:
+        filepath = bpy.path.abspath(filepath) if filepath else ""
+        if not filepath or not filepath.lower().endswith(".blend"):
+            continue
+        _drop_blend_paths.append(filepath)
+    _drop_blend_deadline = _now() + 0.2
+    if not _drop_blend_timer_running:
+        _drop_blend_timer_running = True
+        try:
+            bpy.app.timers.register(_flush_dropped_blend_paths, first_interval=0.2)
+        except ValueError:
+            _flush_dropped_blend_paths()
+
+
+def _queue_dropped_blend_path(filepath):
+    _queue_dropped_blend_paths([filepath])
+
+
+class MBB_OT_confirm_dropped_blends(bpy.types.Operator):
+    bl_idname = "wm.mbb_confirm_dropped_blends"
+    bl_label = "Open Dropped Blend Files"
+    bl_description = "Open the dropped .blend files as bookmark tabs"
+    bl_options = {"INTERNAL"}
+
+    paths: StringProperty(options={"HIDDEN"})
+
+    def draw(self, _context):
+        layout = self.layout
+        paths = self._paths()
+        layout.label(text=f"Open {len(paths)} dropped blend file{'s' if len(paths) != 1 else ''}?")
+        for path in paths[:6]:
+            layout.label(text=os.path.basename(path), icon="FILE_BLEND")
+        if len(paths) > 6:
+            layout.label(text=f"...and {len(paths) - 6} more")
+
+    def _paths(self):
+        try:
+            paths = json.loads(self.paths or "[]")
+        except (TypeError, json.JSONDecodeError):
+            paths = []
+        return [bpy.path.abspath(path) for path in paths if isinstance(path, str)]
+
+    def execute(self, context):
+        result = _open_blend_bookmark_paths(
+            context,
+            self._paths(),
+            load_ui=_default_load_ui(),
+            use_scripts=_default_trusted_source(),
+        )
+        if result == {"CANCELLED"}:
+            self.report({"ERROR"}, "No existing .blend file selected.")
+        return result
+
+    def invoke(self, context, _event):
+        return context.window_manager.invoke_props_dialog(self, width=360)
+
+
 class MBB_OT_open_blend_bookmark(bpy.types.Operator):
     bl_idname = "wm.mbb_open_blend"
     bl_label = "Open Blend Bookmark"
@@ -2317,6 +3131,8 @@ class MBB_OT_open_blend_bookmark(bpy.types.Operator):
     bl_options = {"REGISTER"}
 
     filepath: StringProperty(name="File Path", subtype="FILE_PATH")
+    directory: StringProperty(name="Directory", subtype="DIR_PATH", options={"HIDDEN"})
+    files: CollectionProperty(type=bpy.types.OperatorFileListElement, options={"HIDDEN"})
     hide_props_region: BoolProperty(name="Hide Operator Properties", default=True, options={"HIDDEN"})
     check_existing: BoolProperty(name="Check Existing", default=False, options={"HIDDEN"})
     filter_blender: BoolProperty(name="Filter .blend files", default=True, options={"HIDDEN"})
@@ -2326,29 +3142,46 @@ class MBB_OT_open_blend_bookmark(bpy.types.Operator):
     load_ui: BoolProperty(name="Load UI", default=True)
     use_scripts: BoolProperty(name="Trusted Source", default=False)
     display_file_selector: BoolProperty(name="Display File Selector", default=True, options={"HIDDEN"})
+    opened_from_file_selector: BoolProperty(default=False, options={"HIDDEN"})
     filter_glob: StringProperty(default="*.blend", options={"HIDDEN"})
 
     def invoke(self, context, _event):
         self.load_ui = _default_load_ui()
         self.use_scripts = _default_trusted_source()
+        filepaths = _blend_paths_from_operator(self)
+        if filepaths:
+            _queue_dropped_blend_paths(filepaths)
+            return {"FINISHED"}
+        self.opened_from_file_selector = True
         context.window_manager.fileselect_add(self)
         return {"RUNNING_MODAL"}
 
     def execute(self, context):
-        filepath = bpy.path.abspath(self.filepath)
-        if not filepath:
+        filepaths = _blend_paths_from_operator(self)
+        if not filepaths:
             self.report({"ERROR"}, "No .blend file selected.")
             return {"CANCELLED"}
-        if not filepath.lower().endswith(".blend"):
+        if any(not filepath.lower().endswith(".blend") for filepath in filepaths):
             self.report({"ERROR"}, "Please select a .blend file.")
             return {"CANCELLED"}
+        if len(filepaths) == 1 and not self.opened_from_file_selector and not getattr(self, "files", None):
+            _queue_dropped_blend_path(filepaths[0])
+            return {"FINISHED"}
+        result = _open_blend_bookmark_paths(context, filepaths, load_ui=self.load_ui, use_scripts=self.use_scripts)
+        if result == {"CANCELLED"}:
+            self.report({"ERROR"}, "No existing .blend file selected.")
+        return result
 
-        _remember_overlay_state(context=context)
-        _save_current_project_to_cache(capture_thumbnail=True)
-        _upsert_registry_tab(filepath, _title_from_path(filepath), is_active=True)
-        _sync_registry_to_properties(context)
-        _set_single_selection_for_path(context, filepath)
-        return _open_mainfile_current_window(filepath, load_ui=self.load_ui, use_scripts=self.use_scripts)
+
+class MBB_FH_blend_files(bpy.types.FileHandler):
+    bl_idname = "MBB_FH_blend_files"
+    bl_label = "Multi Files Bookmark Blend Files"
+    bl_import_operator = MBB_OT_open_blend_bookmark.bl_idname
+    bl_file_extensions = ".blend"
+
+    @classmethod
+    def poll_drop(cls, _context):
+        return _use_plugin_drop_panel()
 
 
 class MBB_OT_new_blend_bookmark(bpy.types.Operator):
@@ -2391,7 +3224,7 @@ class MBB_OT_save_original_project(bpy.types.Operator):
         self.compress = _default_file_compression()
         self.relative_remap = _default_relative_remap()
         current = _current_blend_filepath()
-        tab = _find_tab_by_any_path(current) or _active_registry_tab()
+        tab = _current_registry_tab(current)
         target = _manual_save_target_from_tab(tab, current)
         if not target and current and not _is_cache_file_path(current) and not _is_untitled_path(current):
             target = bpy.path.abspath(current)
@@ -2411,12 +3244,12 @@ class MBB_OT_save_original_project(bpy.types.Operator):
             filepath += ".blend"
 
         current = _current_blend_filepath()
-        tab = _find_tab_by_any_path(current) or _active_registry_tab()
+        tab = _current_registry_tab(current)
         old_original = bpy.path.abspath(tab.get("filepath", "")) if tab else ""
         cache_path = bpy.path.abspath(tab.get("cache_filepath", "")) if tab and tab.get("cache_filepath", "") else bpy.path.abspath(current)
 
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        bpy.ops.wm.save_as_mainfile(
+        _save_as_mainfile_resilient(
             "EXEC_DEFAULT",
             filepath=filepath,
             copy=True,
@@ -2440,6 +3273,224 @@ class MBB_OT_save_original_project(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class MBB_OT_open_theme_color_source_menu(bpy.types.Operator):
+    bl_idname = "wm.mbb_open_theme_color_source_menu"
+    bl_label = "Theme Color Source"
+    bl_description = "Choose a Blender theme color item for this UI color"
+    bl_options = {"INTERNAL"}
+
+    target: StringProperty(options={"HIDDEN"})
+
+    def execute(self, _context):
+        global _theme_source_menu_target, _theme_source_menu_current_source
+        _clear_theme_color_preview()
+        _theme_source_menu_target = self.target
+        if not _theme_color_menu_tree.get("children"):
+            _register_theme_color_source_menus()
+        prefs = _addon_preferences()
+        source_prop = f"{self.target}_theme_source"
+        source_path = ""
+        if prefs and hasattr(prefs, source_prop):
+            source_path = getattr(prefs, source_prop, "") or THEME_COLOR_DEFAULTS.get(self.target, "")
+        _theme_source_menu_current_source = source_path
+        if source_path in _theme_color_entry_labels:
+            _preview_theme_color(self.target, source_path)
+        try:
+            bpy.ops.wm.mbb_theme_color_preview_watcher("INVOKE_DEFAULT")
+        except Exception:
+            pass
+        bpy.ops.wm.call_menu(name=MBB_MT_theme_color_source_root.bl_idname)
+        return {"FINISHED"}
+
+
+class MBB_OT_set_theme_color_source(bpy.types.Operator):
+    bl_idname = "wm.mbb_set_theme_color_source"
+    bl_label = "Use Theme Color"
+    bl_description = "Use this Blender theme color for the selected UI color"
+    bl_options = {"INTERNAL"}
+
+    target: StringProperty(options={"HIDDEN"})
+    source_path: StringProperty(options={"HIDDEN"})
+
+    @classmethod
+    def description(cls, _context, properties):
+        _preview_theme_color(getattr(properties, "target", ""), getattr(properties, "source_path", ""))
+        return _theme_source_label(getattr(properties, "source_path", ""))
+
+    def execute(self, context):
+        prefs = _addon_preferences()
+        source_prop = f"{self.target}_theme_source"
+        if not prefs or not hasattr(prefs, source_prop):
+            return {"CANCELLED"}
+        setattr(prefs, source_prop, self.source_path)
+        _clear_theme_color_preview()
+        _request_view3d_redraw(context)
+        return {"FINISHED"}
+
+
+class MBB_OT_theme_color_preview_watcher(bpy.types.Operator):
+    bl_idname = "wm.mbb_theme_color_preview_watcher"
+    bl_label = "Theme Color Preview Watcher"
+    bl_options = {"INTERNAL"}
+
+    def invoke(self, context, _event):
+        context.window_manager.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def modal(self, _context, event):
+        if event.type in {"LEFTMOUSE", "RIGHTMOUSE", "ESC", "RET", "SPACE"} and event.value in {"PRESS", "RELEASE"}:
+            _clear_theme_color_preview()
+            return {"FINISHED", "PASS_THROUGH"}
+        return {"PASS_THROUGH"}
+
+
+def _draw_theme_color_source_node(layout, node):
+    for child in node.get("children", {}).values():
+        menu_class = child.get("menu_class")
+        if menu_class:
+            layout.menu(
+                menu_class.bl_idname,
+                text=_theme_source_menu_text(child.get("label", "")),
+            )
+    for path, label in node.get("items", ()):
+        icon = "CHECKMARK" if path == _theme_source_menu_current_source else "NONE"
+        op = layout.operator(
+            MBB_OT_set_theme_color_source.bl_idname,
+            text=_theme_source_menu_text(label),
+            icon=icon,
+        )
+        op.target = _theme_source_menu_target
+        op.source_path = path
+
+
+def _make_theme_color_source_menu_class(node_id, node):
+    def draw(self, _context):
+        _draw_theme_color_source_node(self.layout, _theme_color_menu_nodes.get(self._theme_node_id, {}))
+
+    class_name = f"MBB_MT_theme_color_source_dynamic_{node_id:04d}"
+    return type(
+        class_name,
+        (bpy.types.Menu,),
+        {
+            "bl_idname": class_name,
+            "bl_label": str(node.get("label", "")),
+            "_theme_node_id": node_id,
+            "draw": draw,
+        },
+    )
+
+
+def _register_theme_color_source_menus():
+    _unregister_theme_color_source_menus()
+    _build_theme_color_data()
+    for node_id, node in _theme_color_menu_nodes.items():
+        if node is _theme_color_menu_tree:
+            continue
+        menu_class = _make_theme_color_source_menu_class(node_id, node)
+        node["menu_class"] = menu_class
+        bpy.utils.register_class(menu_class)
+        _theme_color_dynamic_menu_classes.append(menu_class)
+
+
+def _unregister_theme_color_source_menus():
+    for menu_class in reversed(_theme_color_dynamic_menu_classes):
+        try:
+            bpy.utils.unregister_class(menu_class)
+        except (RuntimeError, ValueError):
+            pass
+    _theme_color_dynamic_menu_classes.clear()
+    for node in _theme_color_menu_nodes.values():
+        node.pop("menu_class", None)
+
+
+class MBB_MT_theme_color_source_root(bpy.types.Menu):
+    bl_idname = "MBB_MT_theme_color_source_root"
+    bl_label = "Theme Color Source"
+
+    def draw(self, _context):
+        _draw_theme_color_source_node(self.layout, _theme_color_menu_tree)
+
+
+class MBB_OT_add_ui_color_preset(bpy.types.Operator):
+    bl_idname = "wm.mbb_add_ui_color_preset"
+    bl_label = "Add Theme"
+    bl_description = "Save current plugin UI colors as a new preset"
+    bl_options = {"INTERNAL"}
+
+    name: StringProperty(name="Name", default="")
+
+    def draw(self, _context):
+        self.layout.prop(self, "name", text="Name")
+
+    def execute(self, context):
+        prefs = _addon_preferences()
+        if not prefs:
+            return {"CANCELLED"}
+        _ensure_ui_color_presets(prefs)
+        name = self.name.strip() or _unique_ui_color_preset_name(prefs, "Default")
+        name = _unique_ui_color_preset_name(prefs, name)
+        preset = prefs.ui_color_presets.add()
+        _store_ui_color_preset_from_prefs(preset, prefs, name)
+        prefs.active_ui_color_preset = preset.preset_id
+        _save_ui_color_presets_to_disk(prefs)
+        _request_view3d_redraw(context)
+        return {"FINISHED"}
+
+    def invoke(self, context, _event):
+        prefs = _addon_preferences()
+        self.name = _unique_ui_color_preset_name(prefs, "Default") if prefs else "Default"
+        return context.window_manager.invoke_props_dialog(self, width=360)
+
+
+class MBB_OT_remove_ui_color_preset(bpy.types.Operator):
+    bl_idname = "wm.mbb_remove_ui_color_preset"
+    bl_label = "Remove UI Color Preset"
+    bl_description = "Remove the current plugin UI color preset"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        prefs = _addon_preferences()
+        if not prefs:
+            return {"CANCELLED"}
+        _ensure_ui_color_presets(prefs)
+        index, _preset = _find_ui_color_preset(prefs, getattr(prefs, "active_ui_color_preset", ""))
+        if index < 0:
+            index = 0
+        prefs.ui_color_presets.remove(index)
+        if not prefs.ui_color_presets:
+            preset = prefs.ui_color_presets.add()
+            _store_default_ui_color_preset(preset)
+            prefs.active_ui_color_preset = preset.preset_id
+            _apply_ui_color_preset(prefs, preset, context)
+            _save_ui_color_presets_to_disk(prefs)
+            return {"FINISHED"}
+        next_index = min(index, len(prefs.ui_color_presets) - 1)
+        preset = prefs.ui_color_presets[next_index]
+        prefs.active_ui_color_preset = preset.preset_id
+        _apply_ui_color_preset(prefs, preset, context)
+        _save_ui_color_presets_to_disk(prefs)
+        return {"FINISHED"}
+
+
+class MBB_OT_save_ui_color_preset(bpy.types.Operator):
+    bl_idname = "wm.mbb_save_ui_color_preset"
+    bl_label = "Save UI Color Preset"
+    bl_description = "Save current plugin UI colors to the active preset"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        prefs = _addon_preferences()
+        if not prefs:
+            return {"CANCELLED"}
+        preset = _ensure_ui_color_presets(prefs)
+        if not preset:
+            return {"CANCELLED"}
+        _store_ui_color_preset_from_prefs(preset, prefs)
+        _save_ui_color_presets_to_disk(prefs)
+        _request_view3d_redraw(context)
+        return {"FINISHED"}
+
+
 class MBB_OT_change_ui_color_menu(bpy.types.Operator):
     bl_idname = "wm.mbb_change_ui_color_menu"
     bl_label = "Change UI Color"
@@ -2450,8 +3501,11 @@ class MBB_OT_change_ui_color_menu(bpy.types.Operator):
         prefs = _addon_preferences()
         if not prefs:
             return
+        _ensure_ui_color_presets(prefs)
         layout = self.layout
-        layout.operator(MBB_OT_reset_ui_colors.bl_idname, text=_t("Reset UI Colors"), icon="FILE_REFRESH")
+        header = layout.row(align=True)
+        header.prop(prefs, "use_theme_colors", text=_t("Read Theme File"))
+        header.operator(MBB_OT_reset_ui_colors.bl_idname, text="", icon="FILE_REFRESH")
         for label, prop_name in (
             ("Panel", "dock_inner_color"),
             ("Selected", "dock_selected_color"),
@@ -2463,7 +3517,30 @@ class MBB_OT_change_ui_color_menu(bpy.types.Operator):
             ("Tooltip Background", "tooltip_background_color"),
             ("Tooltip Text", "tooltip_text_color"),
         ):
-            layout.prop(prefs, prop_name, text=_t(label))
+            self.draw_color_source_row(layout, prefs, label, prop_name)
+        self.draw_color_preset_row(layout, prefs)
+
+    def draw_color_source_row(self, layout, prefs, label, prop_name):
+        row = layout.row(align=True)
+        split = row.split(factor=0.40, align=True)
+        split.label(text=f"{_t(label)}:")
+        right = split.row(align=True)
+        if bool(getattr(prefs, "use_theme_colors", True)):
+            source_prop = f"{prop_name}_theme_source"
+            op = right.operator(
+                MBB_OT_open_theme_color_source_menu.bl_idname,
+                text=_theme_source_label(getattr(prefs, source_prop, THEME_COLOR_DEFAULTS.get(prop_name, ""))),
+            )
+            op.target = prop_name
+        else:
+            right.prop(prefs, prop_name, text="")
+
+    def draw_color_preset_row(self, layout, prefs):
+        row = layout.row(align=True)
+        row.prop(prefs, "active_ui_color_preset", text="")
+        row.operator(MBB_OT_add_ui_color_preset.bl_idname, text="", icon="ADD")
+        row.operator(MBB_OT_remove_ui_color_preset.bl_idname, text="", icon="REMOVE")
+        row.operator(MBB_OT_save_ui_color_preset.bl_idname, text="", icon="FILE_TICK")
 
     def execute(self, _context):
         return {"FINISHED"}
@@ -2487,6 +3564,11 @@ class MBB_OT_user_pref_menu(bpy.types.Operator):
         self.draw_compact_prop(layout, prefs, "cache_directory", _t("Cache Folder"))
         layout.prop(prefs, "show_hover_full_name", text=_t("Show Full Name on Hover"))
         layout.prop(prefs, "show_hover_file_path", text=_t("Show File Path on Hover"))
+        row = layout.row(align=True)
+        row.prop(prefs, "use_plugin_drop_panel", text="")
+        col = row.column(align=True)
+        col.label(text=_t("Use Plugin Panel When Dropping Files Into Blender"))
+        col.label(text=_t("to Support Multiple Files"))
 
     def draw_compact_prop(self, layout, prefs, prop_name, label):
         row = layout.row(align=True)
@@ -2505,26 +3587,18 @@ class MBB_OT_user_pref_menu(bpy.types.Operator):
 class MBB_OT_reset_ui_colors(bpy.types.Operator):
     bl_idname = "wm.mbb_reset_ui_colors"
     bl_label = "Reset UI Colors"
-    bl_description = "Reset dock UI colors to their default values"
+    bl_description = "Reset plugin UI colors to the active saved preset"
     bl_options = {"INTERNAL"}
 
     def execute(self, context):
         prefs = _addon_preferences()
         if not prefs:
             return {"CANCELLED"}
-        defaults = (
-            ("dock_inner_color", DOCK_INNER_COLOR),
-            ("dock_selected_color", DOCK_SELECTED_COLOR),
-            ("dock_tab_color", DOCK_TAB_COLOR),
-            ("dock_button_color", ADD_BUTTON_BLUE),
-            ("dock_plus_button_color", PLUS_BUTTON_COLOR),
-            ("dock_outline_color", DOCK_OUTLINE_COLOR),
-            ("dock_text_color", DOCK_TEXT_COLOR),
-            ("tooltip_background_color", TOOLTIP_BACKGROUND_COLOR),
-            ("tooltip_text_color", TOOLTIP_TEXT_COLOR),
-        )
-        for prop_name, value in defaults:
-            setattr(prefs, prop_name, value)
+        _clear_theme_color_preview()
+        preset = _ensure_ui_color_presets(prefs)
+        if not preset:
+            return {"CANCELLED"}
+        _apply_ui_color_preset(prefs, preset, context)
         _request_view3d_redraw(context)
         try:
             bpy.ops.wm.redraw_timer(type="DRAW_WIN_SWAP", iterations=1)
@@ -3104,8 +4178,7 @@ def _wrap_text_to_width(text, size, max_width):
 
 
 def _unsaved_file_label():
-    locale = str(getattr(bpy.app.translations, "locale", "") or "")
-    return "文件未保存" if locale.startswith("zh") else UNSAVED_FILE_LABEL
+    return _t(UNSAVED_FILE_LABEL)
 
 
 def _tab_tooltip_lines(tab):
@@ -3936,6 +5009,8 @@ class MBB_OT_overlay_router(bpy.types.Operator):
 def _mbb_load_pre(_dummy):
     _persist_overlay_state(bpy.context)
     _remember_overlay_state(context=bpy.context)
+    _register_current_process_tab(is_active=False)
+    _sync_registry_to_properties(bpy.context)
 
 
 @persistent
@@ -4003,12 +5078,63 @@ def _remove_header_toggle():
     _original_draw_xform_template = None
 
 
+def _patched_drop_blend_file_invoke(self, _context, _event):
+    _queue_dropped_blend_path(getattr(self, "filepath", ""))
+    return {"FINISHED"}
+
+
+def _official_drop_blend_file_invoke():
+    try:
+        from bl_operators import wm as wm_operators
+        operator_class = getattr(wm_operators, "WM_OT_drop_blend_file", None)
+        invoke = getattr(operator_class, "invoke", None)
+        if invoke is not None and invoke is not _patched_drop_blend_file_invoke:
+            return invoke
+    except Exception:
+        pass
+    return None
+
+
+def _install_drop_blend_patch():
+    global _original_drop_blend_file_invoke
+    drop_operator = getattr(bpy.types, "WM_OT_drop_blend_file", None)
+    if drop_operator is None:
+        return
+    current_invoke = getattr(drop_operator, "invoke", None)
+    if _original_drop_blend_file_invoke is None:
+        _original_drop_blend_file_invoke = _official_drop_blend_file_invoke()
+        if _original_drop_blend_file_invoke is None and current_invoke is not _patched_drop_blend_file_invoke:
+            _original_drop_blend_file_invoke = current_invoke
+    if current_invoke is _patched_drop_blend_file_invoke:
+        return
+    drop_operator.invoke = _patched_drop_blend_file_invoke
+
+
+def _remove_drop_blend_patch():
+    global _original_drop_blend_file_invoke
+    drop_operator = getattr(bpy.types, "WM_OT_drop_blend_file", None)
+    original_invoke = _original_drop_blend_file_invoke or _official_drop_blend_file_invoke()
+    if drop_operator is not None and original_invoke is not None:
+        drop_operator.invoke = original_invoke
+    _original_drop_blend_file_invoke = None
+
+
 classes = (
+    MBB_UIColorPreset,
     MBB_AddonPreferences,
     MBB_BookmarkItem,
+    MBB_OT_confirm_dropped_blends,
     MBB_OT_open_blend_bookmark,
+    MBB_FH_blend_files,
     MBB_OT_new_blend_bookmark,
     MBB_OT_save_original_project,
+    MBB_OT_open_theme_color_source_menu,
+    MBB_OT_set_theme_color_source,
+    MBB_OT_theme_color_preview_watcher,
+    MBB_MT_theme_color_source_root,
+    MBB_OT_add_ui_color_preset,
+    MBB_OT_remove_ui_color_preset,
+    MBB_OT_save_ui_color_preset,
     MBB_OT_change_ui_color_menu,
     MBB_OT_user_pref_menu,
     MBB_OT_reset_ui_colors,
@@ -4132,6 +5258,7 @@ def register():
 
     for cls in classes:
         bpy.utils.register_class(cls)
+    _register_theme_color_source_menus()
 
     bpy.types.WindowManager.mbb_bookmarks = CollectionProperty(type=MBB_BookmarkItem)
     bpy.types.WindowManager.mbb_view_mode = EnumProperty(
@@ -4148,6 +5275,10 @@ def register():
     _initialize_new_window_session(bpy.context)
     _register_keymaps()
     _install_header_toggle()
+    if _use_plugin_drop_panel():
+        _install_drop_blend_patch()
+    else:
+        _remove_drop_blend_patch()
 
     if _mbb_load_pre not in bpy.app.handlers.load_pre:
         bpy.app.handlers.load_pre.append(_mbb_load_pre)
@@ -4172,6 +5303,7 @@ def unregister():
     _thumbnail_textures.clear()
     _remove_overlay_draw_handler()
     _remove_header_toggle()
+    _remove_drop_blend_patch()
 
     if _mbb_load_pre in bpy.app.handlers.load_pre:
         bpy.app.handlers.load_pre.remove(_mbb_load_pre)
@@ -4187,6 +5319,7 @@ def unregister():
     if hasattr(bpy.types.WindowManager, "mbb_view_mode"):
         del bpy.types.WindowManager.mbb_view_mode
 
+    _unregister_theme_color_source_menus()
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
 

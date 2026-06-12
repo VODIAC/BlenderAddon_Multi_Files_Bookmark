@@ -28,6 +28,26 @@ ZH_CN = {
     ("*", "Background color of bookmark hover tooltips"): "书签悬停注释窗口的背景颜色",
     ("*", "Tooltip Text"): "注释文字",
     ("*", "Text color of bookmark hover tooltips"): "书签悬停注释窗口的文字颜色",
+    ("*", "Read Theme File"): "读取主题文件",
+    ("*", "Read UI colors from the current Blender theme instead of using custom color swatches"): "从当前 Blender 主题读取界面颜色，而不是使用自定义色块",
+    ("*", "Theme Color Source"): "主题颜色来源",
+    ("*", "Choose a Blender theme color item for this UI color"): "为此界面颜色选择一个 Blender 主题颜色条目",
+    ("*", "Use Theme Color"): "使用主题颜色",
+    ("*", "Use this Blender theme color for the selected UI color"): "将这个 Blender 主题颜色用于所选界面颜色",
+    ("*", "User Interface"): "用户界面",
+    ("*", "Regular"): "常规",
+    ("*", "Radio"): "单选",
+    ("*", "Slider"): "滑块",
+    ("*", "Number"): "数值",
+    ("*", "Menu"): "菜单",
+    ("*", "Pie Menu"): "饼菜单",
+    ("*", "Tooltip"): "注释",
+    ("*", "Inner"): "内部",
+    ("*", "Selected Inner"): "选中内部",
+    ("*", "Item"): "项目",
+    ("*", "Selected Text"): "选中文字",
+    ("*", "Back"): "背景",
+    ("*", "Title"): "标题",
     ("*", "Cache Folder"): "缓存目录",
     ("*", "Folder for cached .blend files and bookmark thumbnails"): "用于缓存 .blend 文件和书签缩略图的文件夹",
     ("*", "Change UI Color"): "修改界面颜色",
@@ -44,11 +64,17 @@ ZH_CN = {
     ("*", "Show the full project name while hovering a bookmark tab"): "鼠标悬停在书签标签上时显示完整项目名称",
     ("*", "Show File Path on Hover"): "悬停显示文件路径",
     ("*", "Show the original file path while hovering a bookmark tab"): "鼠标悬停在书签标签上时显示源文件路径",
+    ("*", "Use Plugin Panel When Dropping Files Into Blender to Support Multiple Files"): "拖拽文件进 Blender 打开时使用插件面板，以支持复数文件",
+    ("*", "Use Plugin Panel When Dropping Files Into Blender"): "拖拽文件进 Blender 打开时使用插件面板",
+    ("*", "Use the plugin confirmation panel when dropping .blend files into Blender to support multiple files"): "拖拽 .blend 文件进入 Blender 时使用插件确认面板，以支持复数文件",
+    ("*", "to Support Multiple Files"): "以支持复数文件",
     ("*", "Open List"): "打开列表",
     ("*", "Reset UI Colors"): "重置界面颜色",
     ("*", "Reset dock UI colors to their default values"): "将面板界面颜色恢复为默认值",
+    ("*", "Reset plugin UI colors to the active saved preset"): "将插件界面颜色重置到当前已保存预设",
     ("Operator", "Reset UI Colors"): "重置界面颜色",
     ("Operator", "Reset dock UI colors to their default values"): "将面板界面颜色恢复为默认值",
+    ("Operator", "Reset plugin UI colors to the active saved preset"): "将插件界面颜色重置到当前已保存预设",
     ("*", "Save to Origin"): "保存到原始路径",
     ("*", "Save Project"): "保存项目",
     ("*", "Save the current bookmark project to its original file location"): "将当前书签项目保存到原始文件位置",
@@ -72,7 +98,626 @@ ZH_CN = {
     ("*", "Switch the floating bookmark bar between file-name and thumbnail views"): "在文件名视图和缩略图视图之间切换浮动书签面板",
     ("*", "Shortcut not found"): "未找到快捷键",
     ("*", "Restart Blender"): "重启Blender",
+    ("*", "UI Color Preset"): "界面配色预设",
+    ("*", "Switch between saved plugin UI color presets"): "切换已保存的插件界面配色预设",
+    ("*", "Add Theme"): "添加主题",
+    ("Operator", "Add Theme"): "添加主题",
+    ("*", "Name"): "名称",
+    ("*", "Save UI Color Preset As"): "界面配色另存为",
+    ("*", "Save current plugin UI colors as a new preset"): "将当前插件界面配色另存为新预设",
+    ("*", "Remove UI Color Preset"): "删除界面配色预设",
+    ("*", "Remove the current plugin UI color preset"): "删除当前插件界面配色预设",
+    ("*", "Save UI Color Preset"): "保存界面配色预设",
+    ("*", "Save current plugin UI colors to the active preset"): "将当前插件界面配色保存到当前预设",
+    ("*", "Current file is unsaved"): "文件未保存",
 }
+
+
+ROOT_EN = {
+    "bone_color_sets": "Bone Color Sets",
+    "clip_editor": "Clip Editor",
+    "collection_color": "Collection Color",
+    "common": "Common",
+    "console": "Python Console",
+    "dopesheet_editor": "Dope Sheet",
+    "file_browser": "File Browser",
+    "graph_editor": "Graph Editor",
+    "image_editor": "Image Editor",
+    "info": "Info",
+    "nla_editor": "NLA Editor",
+    "node_editor": "Node Editor",
+    "outliner": "Outliner",
+    "preferences": "Preferences",
+    "properties": "Properties",
+    "regions": "Regions",
+    "sequence_editor": "Video Sequencer",
+    "spreadsheet": "Spreadsheet",
+    "statusbar": "Status Bar",
+    "strip_color": "Strip Color",
+    "text_editor": "Text Editor",
+    "topbar": "Top Bar",
+    "user_interface": "User Interface",
+    "view_3d": "3D View",
+}
+
+
+ROOT_ZH = {
+    "bone_color_sets": "骨骼颜色集",
+    "clip_editor": "剪辑编辑器",
+    "collection_color": "集合颜色",
+    "common": "通用",
+    "console": "Python 控制台",
+    "dopesheet_editor": "摄影表",
+    "file_browser": "文件浏览器",
+    "graph_editor": "曲线编辑器",
+    "image_editor": "图像编辑器",
+    "info": "信息",
+    "nla_editor": "NLA 编辑器",
+    "node_editor": "节点编辑器",
+    "outliner": "大纲视图",
+    "preferences": "偏好设置",
+    "properties": "属性",
+    "regions": "区域",
+    "sequence_editor": "视频序列编辑器",
+    "spreadsheet": "电子表格",
+    "statusbar": "状态栏",
+    "strip_color": "片段颜色",
+    "text_editor": "文本编辑器",
+    "topbar": "顶部栏",
+    "user_interface": "用户界面",
+    "view_3d": "3D 视图",
+}
+
+
+FIELD_EN = {
+    "back": "Background",
+    "high_gradient": "High Gradient",
+    "inner_sel": "Inner Selected",
+    "outline_sel": "Outline Selected",
+    "sub_back": "Sub Background",
+    "text_hi": "Text Hi",
+    "text_sel": "Text Selected",
+}
+
+
+FIELD_ZH = {
+    "active": "活动",
+    "active_marker": "活动标记",
+    "axis_x": "坐标轴 X",
+    "axis_y": "坐标轴 Y",
+    "axis_z": "坐标轴 Z",
+    "back": "背景",
+    "disabled_marker": "禁用标记",
+    "edge_select": "选中边",
+    "empty": "空物体",
+    "extra": "附加",
+    "face": "面",
+    "face_angle": "面角度",
+    "face_area": "面面积",
+    "face_dot": "面中心点",
+    "face_normal": "面法线",
+    "face_select": "选中面",
+    "freestyle": "Freestyle",
+    "gradient": "底部渐变",
+    "gradients": "渐变",
+    "grid": "网格",
+    "grid_major": "主网格",
+    "header": "标题栏",
+    "header_text": "标题栏文字",
+    "header_text_hi": "标题栏高亮文字",
+    "high_gradient": "顶部渐变",
+    "inner": "内部",
+    "inner_sel": "选中内部",
+    "item": "项目",
+    "light": "灯光",
+    "line_numbers": "行号",
+    "line_numbers_background": "行号背景",
+    "match": "匹配项",
+    "outline": "轮廓",
+    "outline_sel": "选中轮廓",
+    "object_active": "活动物体",
+    "object_selected": "选中物体",
+    "selected_text": "选中文本",
+    "space": "空间",
+    "sub_back": "次级背景",
+    "text": "文字",
+    "text_hi": "高亮文字",
+    "text_sel": "选中文字",
+    "title": "标题",
+    "transform": "变换",
+    "vertex": "顶点",
+    "vertex_active": "活动顶点",
+    "vertex_select": "选中顶点",
+    "view_overlay": "视图叠加",
+    "wire": "线框",
+    "wire_edit": "编辑线框",
+}
+
+FIELD_ZH.update({
+    "active_action": "活动动作",
+    "active_action_unset": "未设置活动动作",
+    "active_object": "活动物体",
+    "active_strip": "活动片段",
+    "after_current_frame": "当前帧之后",
+    "anim": "动画",
+    "anim_interpolation_constant": "动画插值常量",
+    "anim_interpolation_linear": "动画插值线性",
+    "anim_interpolation_other": "动画插值其他",
+    "asset_shelf": "资产架",
+    "attribute_node": "属性节点",
+    "audio_strip": "音频片段",
+    "axis_w": "坐标轴 W",
+    "before_current_frame": "当前帧之前",
+    "bevel": "倒角",
+    "bone_locked_weight": "骨骼锁定权重",
+    "bone_pose": "骨骼姿态",
+    "bone_pose_active": "活动骨骼姿态",
+    "bone_solid": "骨骼实体",
+    "bundle_solid": "束实体",
+    "camera": "摄像机",
+    "camera_passepartout": "摄像机遮罩",
+    "camera_path": "摄像机路径",
+    "channel": "通道",
+    "channel_group": "通道组",
+    "channel_group_active": "活动通道组",
+    "channel_selected": "选中通道",
+    "channels": "通道",
+    "channels_sub": "子通道",
+    "clipping_border_3d": "3D 裁剪边框",
+    "closure_zone": "闭合区域",
+    "color": "颜色",
+    "color_node": "颜色节点",
+    "color_strip": "颜色片段",
+    "converter_node": "转换节点",
+    "crease": "折痕",
+    "cursor": "光标",
+    "curves": "曲线",
+    "distor_node": "变形节点",
+    "edge_mode_select": "边模式选择",
+    "edited_object": "编辑物体",
+    "editmesh_active": "活动编辑网格",
+    "editor_border": "编辑器边框",
+    "editor_outline": "编辑器轮廓",
+    "editor_outline_active": "活动编辑器轮廓",
+    "effect_strip": "效果片段",
+    "error": "错误",
+    "extra_edge_angle": "附加边角度",
+    "extra_edge_len": "附加边长度",
+    "extra_face_angle": "附加面角度",
+    "extra_face_area": "附加面面积",
+    "face_back": "背面",
+    "face_front": "正面",
+    "face_mode_select": "面模式选择",
+    "face_retopology": "面重拓扑",
+    "filter_node": "过滤节点",
+    "foreach_geometry_element_zone": "遍历几何元素区域",
+    "frame_node": "帧节点",
+    "geometry_node": "几何节点",
+    "gizmo_a": "Gizmo A",
+    "gizmo_b": "Gizmo B",
+    "gizmo_hi": "Gizmo 高亮",
+    "gizmo_primary": "主 Gizmo",
+    "gizmo_secondary": "次 Gizmo",
+    "gizmo_view_align": "Gizmo 视图对齐",
+    "gp_vertex": "蜡笔顶点",
+    "gp_vertex_select": "选中蜡笔顶点",
+    "gp_wire_edit": "蜡笔编辑线框",
+    "group_node": "组节点",
+    "group_socket_node": "组接口节点",
+    "handle_align": "对齐手柄",
+    "handle_auto": "自动手柄",
+    "handle_auto_clamped": "自动钳制手柄",
+    "handle_free": "自由手柄",
+    "handle_sel_align": "选中对齐手柄",
+    "handle_sel_auto": "选中自动手柄",
+    "handle_sel_auto_clamped": "选中自动钳制手柄",
+    "handle_sel_free": "选中自由手柄",
+    "handle_sel_vect": "选中矢量手柄",
+    "handle_vect": "矢量手柄",
+    "handle_vertex": "手柄顶点",
+    "handle_vertex_select": "选中手柄顶点",
+    "header_back": "标题栏背景",
+    "icon_autokey": "自动关键帧图标",
+    "icon_collection": "集合图标",
+    "icon_folder": "文件夹图标",
+    "icon_modifier": "修改器图标",
+    "icon_object": "物体图标",
+    "icon_object_data": "物体数据图标",
+    "icon_scene": "场景图标",
+    "icon_shading": "着色图标",
+    "image_strip": "图像片段",
+    "info_debug": "调试信息",
+    "info_debug_text": "调试信息文字",
+    "info_error_text": "错误信息文字",
+    "info_info_text": "信息文字",
+    "info_operator": "操作信息",
+    "info_operator_text": "操作信息文字",
+    "info_property": "属性信息",
+    "info_property_text": "属性信息文字",
+    "info_selected": "选中信息",
+    "info_selected_text": "选中信息文字",
+    "info_warning_text": "警告信息文字",
+    "inner_anim": "动画内部",
+    "inner_anim_sel": "选中动画内部",
+    "inner_changed": "已改内部",
+    "inner_changed_sel": "选中已改内部",
+    "inner_driven": "驱动内部",
+    "inner_driven_sel": "选中驱动内部",
+    "inner_key": "关键帧内部",
+    "inner_key_sel": "选中关键帧内部",
+    "inner_overridden": "覆盖内部",
+    "inner_overridden_sel": "选中覆盖内部",
+    "input_node": "输入节点",
+    "keyframe": "关键帧",
+    "keyframe_border": "关键帧边框",
+    "keyframe_border_selected": "选中关键帧边框",
+    "keyframe_breakdown": "分解关键帧",
+    "keyframe_breakdown_selected": "选中分解关键帧",
+    "keyframe_extreme": "极值关键帧",
+    "keyframe_extreme_selected": "选中极值关键帧",
+    "keyframe_generated": "生成关键帧",
+    "keyframe_generated_selected": "选中生成关键帧",
+    "keyframe_jitter": "抖动关键帧",
+    "keyframe_jitter_selected": "选中抖动关键帧",
+    "keyframe_moving_hold": "移动保持关键帧",
+    "keyframe_moving_hold_selected": "选中移动保持关键帧",
+    "keyframe_selected": "选中关键帧",
+    "line_error": "错误行",
+    "line_info": "信息行",
+    "line_input": "输入行",
+    "line_output": "输出行",
+    "locked_marker": "锁定标记",
+    "long_key": "长关键帧",
+    "long_key_selected": "选中长关键帧",
+    "marker": "标记",
+    "marker_outline": "标记轮廓",
+    "mask_strip": "遮罩片段",
+    "matte_node": "遮罩节点",
+    "meta_strip": "元片段",
+    "meta_strips": "元片段",
+    "meta_strips_selected": "选中元片段",
+    "metadatabg": "元数据背景",
+    "metadatatext": "元数据文字",
+    "movie_strip": "影片片段",
+    "movieclip_strip": "影片剪辑片段",
+    "node_active": "活动节点",
+    "node_backdrop": "节点背景",
+    "node_outline": "节点轮廓",
+    "node_selected": "选中节点",
+    "normal": "法线",
+    "nurb_sel_uline": "选中 NURB U 线",
+    "nurb_sel_vline": "选中 NURB V 线",
+    "nurb_uline": "NURB U 线",
+    "nurb_vline": "NURB V 线",
+    "output_node": "输出节点",
+    "panel_active": "活动面板",
+    "panel_back": "面板背景",
+    "panel_header": "面板标题栏",
+    "panel_outline": "面板轮廓",
+    "panel_sub_back": "面板次级背景",
+    "panel_text": "面板文字",
+    "panel_title": "面板标题",
+    "path_after": "路径之后",
+    "path_before": "路径之前",
+    "path_keyframe_after": "路径关键帧之后",
+    "path_keyframe_before": "路径关键帧之前",
+    "playhead": "播放头",
+    "preview_back": "预览背景",
+    "preview_range": "预览范围",
+    "preview_stitch_active": "活动缝合预览",
+    "preview_stitch_edge": "边缝合预览",
+    "preview_stitch_face": "面缝合预览",
+    "preview_stitch_stitchable": "可缝合预览",
+    "preview_stitch_unstitchable": "不可缝合预览",
+    "preview_stitch_vert": "顶点缝合预览",
+    "repeat_zone": "重复区域",
+    "row_alternate": "交替行",
+    "scene_strip": "场景片段",
+    "scene_strip_range": "场景片段范围",
+    "scope_back": "示波器背景",
+    "script_node": "脚本节点",
+    "scrubbing": "擦动",
+    "seam": "缝合边",
+    "select": "选择",
+    "selected_file": "选中文件",
+    "selected_highlight": "选中高亮",
+    "selected_marker": "选中标记",
+    "selected_object": "选中物体",
+    "selected_strip": "选中片段",
+    "shader_node": "着色器节点",
+    "sharp": "锐边",
+    "sidebars": "侧栏",
+    "simulated_frames": "模拟帧",
+    "simulation_zone": "模拟区域",
+    "skin_root": "蒙皮根",
+    "sound_strips": "声音片段",
+    "sound_strips_selected": "选中声音片段",
+    "speaker": "扬声器",
+    "split_normal": "拆分法线",
+    "strips": "片段",
+    "strips_selected": "选中片段",
+    "success": "成功",
+    "summary": "摘要",
+    "tab_back": "标签页背景",
+    "text_grease_pencil": "蜡笔文字",
+    "text_selected": "选中文字",
+    "text_strip": "文本片段",
+    "text_strip_cursor": "文本片段光标",
+    "texture_node": "纹理节点",
+    "time_marker": "时间标记",
+    "time_marker_selected": "选中时间标记",
+    "transition_strip": "转场片段",
+    "transition_strips": "转场片段",
+    "transition_strips_selected": "选中转场片段",
+    "transparent_checker_primary": "透明棋盘主色",
+    "transparent_checker_secondary": "透明棋盘次色",
+    "tweak": "微调",
+    "tweak_duplicate": "复制微调",
+    "uv_shadow": "UV 阴影",
+    "vector_node": "矢量节点",
+    "warning": "警告",
+    "widget_emboss": "控件压印",
+    "widget_text_cursor": "文本光标",
+    "wire_inner": "线框内部",
+    "wire_select": "选中线框",
+})
+
+
+TOKEN_ZH = {
+    "a": "A",
+    "action": "动作",
+    "active": "活动",
+    "after": "之后",
+    "align": "对齐",
+    "anim": "动画",
+    "area": "面积",
+    "asset": "资产",
+    "audio": "音频",
+    "auto": "自动",
+    "autokey": "自动关键帧",
+    "b": "B",
+    "back": "背景",
+    "before": "之前",
+    "bevel": "倒角",
+    "bone": "骨骼",
+    "border": "边框",
+    "breakdown": "分解",
+    "bundle": "束",
+    "camera": "摄像机",
+    "channel": "通道",
+    "checker": "棋盘",
+    "clamped": "钳制",
+    "clipping": "裁剪",
+    "closure": "闭合",
+    "collection": "集合",
+    "color": "颜色",
+    "constant": "常量",
+    "current": "当前",
+    "cursor": "光标",
+    "debug": "调试",
+    "driven": "驱动",
+    "duplicate": "复制",
+    "edge": "边",
+    "editor": "编辑器",
+    "effect": "效果",
+    "element": "元素",
+    "error": "错误",
+    "extreme": "极值",
+    "face": "面",
+    "file": "文件",
+    "folder": "文件夹",
+    "frame": "帧",
+    "free": "自由",
+    "front": "正面",
+    "generated": "生成",
+    "geometry": "几何",
+    "gizmo": "Gizmo",
+    "graph": "曲线",
+    "grease": "蜡笔",
+    "group": "组",
+    "handle": "手柄",
+    "header": "标题栏",
+    "hi": "高亮",
+    "highlight": "高亮",
+    "icon": "图标",
+    "info": "信息",
+    "inner": "内部",
+    "input": "输入",
+    "interpolation": "插值",
+    "jitter": "抖动",
+    "key": "关键帧",
+    "keyframe": "关键帧",
+    "len": "长度",
+    "linear": "线性",
+    "locked": "锁定",
+    "marker": "标记",
+    "mesh": "网格",
+    "mode": "模式",
+    "modifier": "修改器",
+    "moving": "移动",
+    "node": "节点",
+    "normal": "法线",
+    "object": "物体",
+    "operator": "操作",
+    "other": "其他",
+    "outline": "轮廓",
+    "overridden": "覆盖",
+    "panel": "面板",
+    "path": "路径",
+    "pencil": "蜡笔",
+    "pose": "姿态",
+    "preview": "预览",
+    "primary": "主",
+    "property": "属性",
+    "range": "范围",
+    "repeat": "重复",
+    "root": "根",
+    "scene": "场景",
+    "secondary": "次",
+    "select": "选择",
+    "selected": "选中",
+    "sel": "选中",
+    "shader": "着色器",
+    "shading": "着色",
+    "shadow": "阴影",
+    "sharp": "锐边",
+    "shelf": "架",
+    "simulation": "模拟",
+    "solid": "实体",
+    "socket": "接口",
+    "speaker": "扬声器",
+    "split": "拆分",
+    "strip": "片段",
+    "strips": "片段",
+    "stitch": "缝合",
+    "stitchable": "可缝合",
+    "sub": "次级",
+    "success": "成功",
+    "text": "文字",
+    "transparent": "透明",
+    "uline": "U 线",
+    "unset": "未设置",
+    "unstitchable": "不可缝合",
+    "uv": "UV",
+    "vect": "矢量",
+    "vector": "矢量",
+    "vert": "顶点",
+    "vertex": "顶点",
+    "view": "视图",
+    "warning": "警告",
+    "weight": "权重",
+    "wire": "线框",
+    "zone": "区域",
+}
+
+
+WIDGET_ZH = {
+    "box": "框",
+    "curve": "曲线",
+    "list_item": "列表项",
+    "menu": "菜单控件",
+    "menu_back": "菜单背景",
+    "menu_item": "菜单项",
+    "num": "数值",
+    "numslider": "滑块",
+    "option": "选项",
+    "pie_menu": "饼菜单",
+    "progress": "进度条",
+    "radio": "单选",
+    "regular": "常规",
+    "scroll": "滚动条",
+    "state": "状态",
+    "tab": "标签页",
+    "text": "文本",
+    "toggle": "开关",
+    "tool": "工具",
+    "toolbar_item": "工具栏项",
+    "tooltip": "工具提示",
+    "pulldown": "下拉",
+}
+
+
+def title_from_identifier(identifier):
+    return FIELD_EN.get(identifier, identifier.replace("_", " ").title())
+
+
+def zh_from_identifier(identifier):
+    if identifier in FIELD_ZH:
+        return FIELD_ZH[identifier]
+    return " ".join(TOKEN_ZH.get(part, part.upper() if len(part) == 1 else part) for part in identifier.split("_"))
+
+
+def hierarchy_label(path):
+    parts = path.split(".")
+    labels = [ROOT_EN.get(parts[0], title_from_identifier(parts[0]))]
+    for part in parts[1:]:
+        if part.startswith("wcol_"):
+            widget = title_from_identifier(part[5:])
+            if widget != "State":
+                widget = f"{widget} Widget"
+            labels.append(widget)
+        else:
+            labels.append(title_from_identifier(part))
+    return "> ".join(labels)
+
+
+def hierarchy_label_zh(path):
+    parts = path.split(".")
+    labels = [ROOT_ZH.get(parts[0], zh_from_identifier(parts[0]))]
+    for part in parts[1:]:
+        if part.startswith("wcol_"):
+            labels.append(WIDGET_ZH.get(part[5:], zh_from_identifier(part[5:])))
+        else:
+            labels.append(zh_from_identifier(part))
+    return "> ".join(labels)
+
+
+
+
+def _split_theme_path_part(part):
+    if "[" not in part:
+        return part, None
+    identifier, rest = part.split("[", 1)
+    return identifier, rest.split("]", 1)[0]
+
+
+def _theme_collection_item_label(root_identifier, index_text):
+    if index_text is None:
+        return None
+    if root_identifier == "bone_color_sets":
+        return f"Bone Color Set {index_text}"
+    if root_identifier == "collection_color":
+        return f"Collection Color {index_text}"
+    if root_identifier == "strip_color":
+        return f"Strip Color {index_text}"
+    return str(index_text)
+
+
+def theme_path_labels(path, fallback_labels=()):
+    parts = [part for part in str(path or "").split(".") if part]
+    if not parts:
+        return tuple(fallback_labels)
+    root_identifier, root_index = _split_theme_path_part(parts[0])
+    labels_en = [ROOT_EN.get(root_identifier, title_from_identifier(root_identifier))]
+    item_en = _theme_collection_item_label(root_identifier, root_index)
+    if item_en is not None:
+        labels_en.append(item_en)
+    for part in parts[1:]:
+        identifier, index_text = _split_theme_path_part(part)
+        if identifier.startswith("wcol_"):
+            widget_identifier = identifier[5:]
+            widget = title_from_identifier(widget_identifier)
+            if widget != "State":
+                widget = f"{widget} Widget"
+            labels_en.append(widget)
+        else:
+            labels_en.append(title_from_identifier(identifier))
+        item_en = _theme_collection_item_label(identifier, index_text)
+        if item_en is not None:
+            labels_en.append(item_en)
+    return tuple(labels_en)
+
+
+def _register_theme_label_translations():
+    for identifier, label in ROOT_EN.items():
+        ZH_CN[("*", label)] = ROOT_ZH.get(identifier, zh_from_identifier(identifier))
+    for identifier, label in FIELD_EN.items():
+        ZH_CN[("*", label)] = FIELD_ZH.get(identifier, zh_from_identifier(identifier))
+    for identifier, label in WIDGET_ZH.items():
+        widget = title_from_identifier(identifier)
+        if widget != "State":
+            widget = f"{widget} Widget"
+        ZH_CN[("*", widget)] = label
+    for identifier, label in FIELD_ZH.items():
+        ZH_CN[("*", title_from_identifier(identifier))] = label
+    for index in range(32):
+        ZH_CN[("*", f"Bone Color Set {index}")] = f"{ROOT_ZH['bone_color_sets']} {index}"
+    for index in range(16):
+        ZH_CN[("*", f"Collection Color {index}")] = f"{ROOT_ZH['collection_color']} {index}"
+        ZH_CN[("*", f"Strip Color {index}")] = f"{ROOT_ZH['strip_color']} {index}"
+
+
+_register_theme_label_translations()
 
 TRANSLATIONS = {
     "zh_HANS": ZH_CN,
