@@ -31,11 +31,13 @@ ADDON_ID = "multi_blender_bookmark"
 ADDON_MODULE = __package__
 CACHE_FOLDER_NAME = "Blender Bookmark"
 DEFAULT_CACHE_DIR = os.path.join(tempfile.gettempdir(), CACHE_FOLDER_NAME)
+SCREENSHOT_FOLDER_NAME = "screenshot"
+PANEL_COLOR_FOLDER_NAME = "panelcolor"
+STATE_FOLDER_NAME = "state"
+DEFAULT_STATE_DIR = os.path.join(DEFAULT_CACHE_DIR, STATE_FOLDER_NAME)
 SESSION_ID = f"pid_{os.getpid()}"
-REGISTRY_PATH = os.path.join(DEFAULT_CACHE_DIR, f"multi_blender_bookmark_{SESSION_ID}.json")
+PROCESS_SESSION_MARKER = "_multi_blender_bookmark_session_id"
 LEGACY_REGISTRY_PATH = os.path.join(tempfile.gettempdir(), "multi_blender_bookmark.json")
-LAST_CLOSED_PATH = os.path.join(DEFAULT_CACHE_DIR, f"multi_blender_bookmark_last_closed_{SESSION_ID}.json")
-OVERLAY_STATE_PATH = os.path.join(DEFAULT_CACHE_DIR, "multi_blender_bookmark_overlay_state.json")
 UI_COLOR_PRESETS_FILENAME = "multi_blender_bookmark_ui_color_presets.json"
 UI_COLOR_PRESETS_LOCATION_FILENAME = "multi_blender_bookmark_ui_color_presets_location.json"
 
@@ -123,6 +125,7 @@ _overlay_view_mode_state = "NAMES"
 _pending_overlay_state = ""
 _original_draw_xform_template = None
 _original_drop_blend_file_invoke = None
+_original_system_menu_draw = None
 _drop_blend_paths = []
 _drop_blend_deadline = 0.0
 _drop_blend_timer_running = False
@@ -136,6 +139,9 @@ _thumbnail_textures = {}
 _sdf_round_rect_shader = None
 _sdf_line_shader = None
 _sdf_shader_warning_printed = False
+_foreground_autosave_seconds = {}
+_foreground_autosave_last_tick = 0.0
+_reload_scripts_pending = False
 
 SHORTCUT_DEFAULTS = {
     "shortcut_new_file": "CTRL T",
@@ -180,6 +186,7 @@ _selection_anchor_index = -1
 _last_closed_tabs = []
 _closed_tab_history = []
 _startup_session_initialized = False
+_startup_session_deadline = 0.0
 
 
 def _now():
@@ -197,12 +204,25 @@ def _clear_thumbnail_texture(filepath):
 
 
 def _title_from_path(filepath):
+    def _untitled_title():
+        try:
+            return bpy.app.translations.pgettext_iface("Untitled") or "Untitled"
+        except Exception:
+            return "Untitled"
+
     if filepath:
         title = os.path.basename(bpy.path.abspath(filepath)) or "Untitled"
         if title.lower().endswith(".blend"):
             title = title[:-6]
-        return title or "Untitled"
-    return "Untitled"
+        lowered = title.lower()
+        if lowered == "untitled":
+            return _untitled_title()
+        if lowered.startswith("untitled_") and lowered[9:].isdigit():
+            return _untitled_title() + title[8:]
+        if lowered.startswith("untitled ") and lowered[9:].isdigit():
+            return _untitled_title() + "_" + title[9:]
+        return title or _untitled_title()
+    return _untitled_title()
 
 
 def _display_title(title):
@@ -346,6 +366,30 @@ def _window_manager_from_context(context=None):
         return None
 
 
+def _normalized_path(filepath):
+    return os.path.normcase(os.path.abspath(bpy.path.abspath(filepath))) if filepath else ""
+
+
+def _process_session_is_registered(context=None):
+    wm = _window_manager_from_context(context)
+    if wm is None:
+        return False
+    try:
+        return wm.get(PROCESS_SESSION_MARKER, "") == SESSION_ID
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        return False
+
+
+def _mark_process_session_registered(context=None):
+    wm = _window_manager_from_context(context)
+    if wm is None:
+        return
+    try:
+        wm[PROCESS_SESSION_MARKER] = SESSION_ID
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        pass
+
+
 def _cache_dir():
     prefs = _addon_preferences()
     if prefs and hasattr(prefs, "cache_directory") and prefs.cache_directory:
@@ -364,6 +408,265 @@ def _cache_dir():
         path = os.path.join(bpy.app.tempdir or tempfile.gettempdir(), CACHE_FOLDER_NAME)
         os.makedirs(path, exist_ok=True)
     return path
+
+
+def _cache_subdir(name, cache_directory=None):
+    directory = bpy.path.abspath(cache_directory) if cache_directory else _cache_dir()
+    path = os.path.join(directory, name)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _screenshot_dir(cache_directory=None):
+    return _cache_subdir(SCREENSHOT_FOLDER_NAME, cache_directory)
+
+
+def _panel_color_dir(cache_directory=None):
+    return _cache_subdir(PANEL_COLOR_FOLDER_NAME, cache_directory)
+
+
+def _state_dir(cache_directory=None):
+    return _cache_subdir(STATE_FOLDER_NAME, cache_directory)
+
+
+def _registry_path(cache_directory=None):
+    return os.path.join(_state_dir(cache_directory), f"multi_blender_bookmark_{SESSION_ID}.json")
+
+
+def _overlay_state_path(cache_directory=None):
+    return os.path.join(_state_dir(cache_directory), "multi_blender_bookmark_overlay_state.json")
+
+
+def _is_plugin_generated_cache_file(filepath, section=""):
+    name = os.path.basename(filepath).lower()
+    if section == SCREENSHOT_FOLDER_NAME:
+        return name.endswith(".png") and (name.startswith("preview_") or name.endswith(".preview.png"))
+    if section == PANEL_COLOR_FOLDER_NAME:
+        preset_name = UI_COLOR_PRESETS_FILENAME.lower()
+        return name in {preset_name, preset_name + ".tmp"}
+    if section == STATE_FOLDER_NAME:
+        return name.startswith("multi_blender_bookmark") and (name.endswith(".json") or name.endswith(".json.tmp"))
+    if name == UI_COLOR_PRESETS_FILENAME.lower():
+        return True
+    if name.startswith("multi_blender_bookmark") and (name.endswith(".json") or name.endswith(".json.tmp")):
+        return True
+    blend_index = name.rfind(".blend")
+    return blend_index >= 0 and (not name[blend_index + 6:] or name[blend_index + 6:].isdigit())
+
+
+def _remove_owned_cache_directory(cache_directory):
+    directory = os.path.abspath(bpy.path.abspath(cache_directory))
+    if not os.path.isdir(directory):
+        return True
+    owned_sections = {SCREENSHOT_FOLDER_NAME, PANEL_COLOR_FOLDER_NAME, STATE_FOLDER_NAME}
+    files_to_remove = []
+    directories_to_remove = []
+    for current_directory, child_directories, filenames in os.walk(directory):
+        relative = os.path.relpath(current_directory, directory)
+        parts = [] if relative == "." else relative.split(os.sep)
+        if len(parts) > 1 or (parts and parts[0] not in owned_sections):
+            return False
+        if not parts:
+            if any(name not in owned_sections for name in child_directories):
+                return False
+            section = ""
+        else:
+            if child_directories:
+                return False
+            section = parts[0]
+        for name in filenames:
+            path = os.path.join(current_directory, name)
+            if not _is_plugin_generated_cache_file(path, section):
+                return False
+            files_to_remove.append(path)
+        if parts:
+            directories_to_remove.append(current_directory)
+
+    try:
+        for path in files_to_remove:
+            os.remove(path)
+        for path in sorted(directories_to_remove, key=len, reverse=True):
+            os.rmdir(path)
+        os.rmdir(directory)
+        return True
+    except OSError:
+        return False
+
+
+def _move_file_replacing(source, destination):
+    if not source or not destination:
+        return False
+    source = os.path.abspath(source)
+    destination = os.path.abspath(destination)
+    if os.path.normcase(source) == os.path.normcase(destination) or not os.path.isfile(source):
+        return False
+    try:
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        if os.path.exists(destination):
+            os.remove(destination)
+        shutil.move(source, destination)
+        return True
+    except (OSError, shutil.Error):
+        return False
+
+
+def _move_directory_contents(source_directory, destination_directory):
+    if not os.path.isdir(source_directory):
+        return
+    os.makedirs(destination_directory, exist_ok=True)
+    for name in os.listdir(source_directory):
+        source = os.path.join(source_directory, name)
+        destination = os.path.join(destination_directory, name)
+        if os.path.isdir(source):
+            _move_directory_contents(source, destination)
+            try:
+                os.rmdir(source)
+            except OSError:
+                pass
+        else:
+            _move_file_replacing(source, destination)
+
+
+def _rewrite_migrated_thumbnail_paths(registry_path, old_directory, new_directory):
+    if not os.path.isfile(registry_path):
+        return
+    try:
+        with open(registry_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return
+    changed = False
+    old_directory = os.path.normcase(os.path.abspath(old_directory))
+    for tab in data.get("tabs", ()) if isinstance(data, dict) else ():
+        path = str(tab.get("thumbnail_filepath", ""))
+        if not path:
+            continue
+        absolute = os.path.abspath(bpy.path.abspath(path))
+        try:
+            parent = os.path.normcase(os.path.commonpath([absolute, old_directory]))
+        except (OSError, ValueError):
+            continue
+        if parent != old_directory:
+            continue
+        migrated = os.path.join(new_directory, os.path.basename(absolute))
+        if os.path.exists(migrated):
+            tab["thumbnail_filepath"] = migrated
+            changed = True
+    if not changed:
+        return
+    try:
+        temp_path = registry_path + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+        os.replace(temp_path, registry_path)
+    except OSError:
+        pass
+
+
+def _path_is_within(path, directory):
+    if not path or not directory:
+        return False
+    try:
+        absolute = os.path.normcase(os.path.abspath(bpy.path.abspath(path)))
+        directory = os.path.normcase(os.path.abspath(bpy.path.abspath(directory)))
+        return os.path.normcase(os.path.commonpath([absolute, directory])) == directory
+    except (OSError, ValueError):
+        return False
+
+
+def _rewrite_migrated_cache_paths(registry_path, old_directory, new_directory):
+    if not os.path.isfile(registry_path):
+        return
+    try:
+        with open(registry_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return
+    changed = False
+    for tab in data.get("tabs", ()) if isinstance(data, dict) else ():
+        for key in ("filepath", "cache_filepath"):
+            old_path = str(tab.get(key, ""))
+            if not _path_is_within(old_path, old_directory):
+                continue
+            relative = os.path.relpath(os.path.abspath(bpy.path.abspath(old_path)), os.path.abspath(old_directory))
+            new_path = os.path.abspath(os.path.join(new_directory, relative))
+            if os.path.exists(new_path):
+                tab[key] = new_path
+                changed = True
+        thumbnail = str(tab.get("thumbnail_filepath", ""))
+        if _path_is_within(thumbnail, old_directory):
+            new_thumbnail = os.path.join(_screenshot_dir(new_directory), os.path.basename(bpy.path.abspath(thumbnail)))
+            if os.path.exists(new_thumbnail):
+                tab["thumbnail_filepath"] = new_thumbnail
+                changed = True
+    if not changed:
+        return
+    try:
+        temp_path = registry_path + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+        os.replace(temp_path, registry_path)
+    except OSError:
+        pass
+
+
+def _migrate_cache_layout(cache_directory=None):
+    directory = bpy.path.abspath(cache_directory) if cache_directory else _cache_dir()
+    os.makedirs(directory, exist_ok=True)
+    screenshot_directory = _screenshot_dir(directory)
+    panel_color_directory = _panel_color_dir(directory)
+
+    for name in list(os.listdir(directory)):
+        source = os.path.join(directory, name)
+        if not os.path.isfile(source):
+            continue
+        lowered = name.lower()
+        if lowered.endswith(".png") and (lowered.startswith("preview_") or lowered.endswith(".preview.png")):
+            _move_file_replacing(source, os.path.join(screenshot_directory, name))
+        elif name == UI_COLOR_PRESETS_FILENAME:
+            _move_file_replacing(source, os.path.join(panel_color_directory, name))
+
+    history_paths = globals().get("_registry_history_paths")
+    if history_paths:
+        for path in history_paths():
+            _rewrite_migrated_thumbnail_paths(path, directory, screenshot_directory)
+
+    state_directory = _state_dir(directory)
+    state_names = []
+    for name in list(os.listdir(directory)):
+        if not name.startswith("multi_blender_bookmark") or not name.endswith(".json"):
+            continue
+        if name == UI_COLOR_PRESETS_FILENAME:
+            continue
+        state_names.append(name)
+    for name in state_names:
+        _move_file_replacing(os.path.join(directory, name), os.path.join(state_directory, name))
+    for name in os.listdir(state_directory):
+        if name.startswith("multi_blender_bookmark") and name.endswith(".json"):
+            _rewrite_migrated_thumbnail_paths(os.path.join(state_directory, name), directory, screenshot_directory)
+
+
+def _migrate_cache_directory_contents(old_directory, new_directory):
+    old_directory = bpy.path.abspath(old_directory or DEFAULT_CACHE_DIR)
+    new_directory = bpy.path.abspath(new_directory or DEFAULT_CACHE_DIR)
+    if os.path.normcase(os.path.abspath(old_directory)) == os.path.normcase(os.path.abspath(new_directory)):
+        _migrate_cache_layout(new_directory)
+        return
+    os.makedirs(new_directory, exist_ok=True)
+    for name in (SCREENSHOT_FOLDER_NAME, PANEL_COLOR_FOLDER_NAME, STATE_FOLDER_NAME):
+        source = os.path.join(old_directory, name)
+        destination = os.path.join(new_directory, name)
+        _move_directory_contents(source, destination)
+    for name in list(os.listdir(old_directory)) if os.path.isdir(old_directory) else ():
+        source = os.path.join(old_directory, name)
+        if os.path.isfile(source) and (name.lower().endswith(".blend") or name == UI_COLOR_PRESETS_FILENAME):
+            _move_file_replacing(source, os.path.join(new_directory, name))
+    _migrate_cache_layout(new_directory)
+    history_paths = globals().get("_registry_history_paths")
+    if history_paths:
+        for path in history_paths():
+            _rewrite_migrated_cache_paths(path, old_directory, new_directory)
+    _remove_owned_cache_directory(old_directory)
 
 
 def _cache_path_for(filepath):
@@ -416,15 +719,15 @@ def _tab_id_for_thumbnail(filepath):
 
 def _thumbnail_path_for(filepath, tab_id=""):
     if tab_id:
-        return os.path.join(_cache_dir(), "preview_" + _safe_filename_part(tab_id) + ".png")
+        return os.path.join(_screenshot_dir(), "preview_" + _safe_filename_part(tab_id) + ".png")
     resolved_tab_id = _tab_id_for_thumbnail(filepath)
     if resolved_tab_id:
-        return os.path.join(_cache_dir(), "preview_" + _safe_filename_part(resolved_tab_id) + ".png")
+        return os.path.join(_screenshot_dir(), "preview_" + _safe_filename_part(resolved_tab_id) + ".png")
     name = os.path.basename(bpy.path.abspath(filepath)) or "untitled.blend"
     if name.lower().endswith(".blend"):
         name = name[:-6]
     safe_name = _safe_filename_part(name)
-    return os.path.join(_cache_dir(), safe_name + ".preview.png")
+    return os.path.join(_screenshot_dir(), safe_name + ".preview.png")
 
 
 def _candidate_thumbnail_paths(tab):
@@ -760,12 +1063,17 @@ _applying_ui_color_preset = False
 
 
 def _ui_color_presets_path(cache_directory=None):
-    directory = bpy.path.abspath(cache_directory) if cache_directory else _cache_dir()
-    return os.path.join(directory, UI_COLOR_PRESETS_FILENAME)
+    return os.path.join(_panel_color_dir(cache_directory), UI_COLOR_PRESETS_FILENAME)
 
 
 def _ui_color_presets_location_path():
-    return os.path.join(DEFAULT_CACHE_DIR, UI_COLOR_PRESETS_LOCATION_FILENAME)
+    try:
+        directory = bpy.utils.user_resource("CONFIG")
+    except Exception:
+        directory = ""
+    directory = directory or tempfile.gettempdir()
+    os.makedirs(directory, exist_ok=True)
+    return os.path.join(directory, UI_COLOR_PRESETS_LOCATION_FILENAME)
 
 
 def _save_ui_color_presets_location(cache_directory):
@@ -780,6 +1088,10 @@ def _save_ui_color_presets_location(cache_directory):
 
 def _load_ui_color_presets_location():
     path = _ui_color_presets_location_path()
+    legacy_path = os.path.join(DEFAULT_STATE_DIR, UI_COLOR_PRESETS_LOCATION_FILENAME)
+    if not os.path.exists(path) and os.path.exists(legacy_path):
+        _move_file_replacing(legacy_path, path)
+        _remove_owned_cache_directory(DEFAULT_CACHE_DIR)
     if not os.path.exists(path):
         return ""
     try:
@@ -878,8 +1190,16 @@ def _load_ui_color_presets_from_disk(prefs):
     cache_directory = bpy.path.abspath(getattr(prefs, "cache_directory", "") or DEFAULT_CACHE_DIR)
     path = _ui_color_presets_path(cache_directory)
     if not os.path.exists(path):
+        legacy_path = os.path.join(cache_directory, UI_COLOR_PRESETS_FILENAME)
+        if os.path.exists(legacy_path):
+            _move_file_replacing(legacy_path, path)
+    if not os.path.exists(path):
         located_directory = _load_ui_color_presets_location()
         located_path = _ui_color_presets_path(located_directory) if located_directory else ""
+        if located_directory and not os.path.exists(located_path):
+            legacy_located_path = os.path.join(located_directory, UI_COLOR_PRESETS_FILENAME)
+            if os.path.exists(legacy_located_path):
+                _move_file_replacing(legacy_located_path, located_path)
         if located_path and os.path.exists(located_path):
             cache_directory = located_directory
             path = located_path
@@ -1020,19 +1340,9 @@ def _update_active_ui_color_preset(self, context=None):
 def _update_cache_directory(self, _context=None):
     old_dir = bpy.path.abspath(getattr(self, "ui_color_presets_cache_directory", "") or DEFAULT_CACHE_DIR)
     new_dir = bpy.path.abspath(getattr(self, "cache_directory", "") or DEFAULT_CACHE_DIR)
-    old_path = _ui_color_presets_path(old_dir)
-    new_path = _ui_color_presets_path(new_dir)
-    if os.path.normcase(os.path.abspath(old_path)) != os.path.normcase(os.path.abspath(new_path)):
-        try:
-            os.makedirs(os.path.dirname(new_path), exist_ok=True)
-            if os.path.exists(old_path):
-                if os.path.exists(new_path):
-                    os.remove(new_path)
-                shutil.move(old_path, new_path)
-            else:
-                _save_ui_color_presets_to_disk(self)
-        except (OSError, shutil.Error):
-            _save_ui_color_presets_to_disk(self)
+    _migrate_cache_directory_contents(old_dir, new_dir)
+    if not os.path.exists(_ui_color_presets_path(new_dir)):
+        _save_ui_color_presets_to_disk(self)
     self.ui_color_presets_cache_directory = new_dir
     _save_ui_color_presets_location(new_dir)
 
@@ -1487,8 +1797,9 @@ def _capture_current_thumbnail(filepath, force=False):
 
 
 def _read_registry():
+    path = _registry_path()
     try:
-        with open(REGISTRY_PATH, "r", encoding="utf-8") as handle:
+        with open(path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {"tabs": []}
@@ -1500,12 +1811,13 @@ def _read_registry():
 
 
 def _write_registry(data):
+    path = _registry_path()
     safe_data = {"tabs": data.get("tabs", [])}
-    os.makedirs(os.path.dirname(REGISTRY_PATH), exist_ok=True)
-    temp_path = REGISTRY_PATH + ".tmp"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp_path = path + ".tmp"
     with open(temp_path, "w", encoding="utf-8") as handle:
         json.dump(safe_data, handle, ensure_ascii=False, indent=2)
-    os.replace(temp_path, REGISTRY_PATH)
+    os.replace(temp_path, path)
 
 
 def _read_tabs_file(path):
@@ -1527,13 +1839,14 @@ def _write_tabs_file(path, data):
 
 def _registry_history_paths():
     paths = []
-    try:
-        for name in os.listdir(DEFAULT_CACHE_DIR):
-            if name.startswith("multi_blender_bookmark") and name.endswith(".json") and "overlay_state" not in name and "last_closed" not in name:
-                paths.append(os.path.join(DEFAULT_CACHE_DIR, name))
-    except OSError:
-        pass
-    paths.extend([REGISTRY_PATH, LEGACY_REGISTRY_PATH])
+    for directory in (_state_dir(), DEFAULT_STATE_DIR, DEFAULT_CACHE_DIR):
+        try:
+            for name in os.listdir(directory):
+                if name.startswith("multi_blender_bookmark") and name.endswith(".json") and "overlay_state" not in name and "last_closed" not in name and "ui_color" not in name:
+                    paths.append(os.path.join(directory, name))
+        except OSError:
+            pass
+    paths.extend([_registry_path(), LEGACY_REGISTRY_PATH])
     unique = []
     seen = set()
     for path in paths:
@@ -1685,14 +1998,15 @@ def _initialize_new_window_session(context=None):
     _startup_session_initialized = True
     _last_closed_tabs = []
     _closed_tab_history = []
-    if _clean_registry(_read_registry())["tabs"]:
+    existing_data = _clean_registry(_read_registry())
+    current = _current_blend_filepath()
+    if existing_data["tabs"] and current:
         _register_current_process_tab(is_active=True)
         _sync_registry_to_properties(context or bpy.context)
         return
 
-    current = _current_blend_filepath()
     if not current:
-        current = _first_window_untitled_cache_path()
+        current = _next_untitled_cache_path() if existing_data["tabs"] else _first_window_untitled_cache_path()
         try:
             _save_as_mainfile_resilient("EXEC_DEFAULT", filepath=current, copy=False, check_existing=False)
         except Exception:
@@ -1705,7 +2019,7 @@ def _initialize_new_window_session(context=None):
         tab_id = original_tab.get("tab_id", "") if original_tab else ""
         thumbnail_filepath = original_tab.get("thumbnail_filepath", "") if original_tab else ""
         thumbnail_placeholder = bool(original_tab.get("thumbnail_placeholder", False)) if original_tab else _is_untitled_path(current)
-        _write_registry({"tabs": [{
+        new_tab = {
             "tab_id": tab_id or (_new_tab_id() if _is_untitled_path(filepath) else _stable_tab_id_for_paths(filepath, cache_filepath)),
             "filepath": filepath,
             "cache_filepath": cache_filepath,
@@ -1715,10 +2029,58 @@ def _initialize_new_window_session(context=None):
             "is_active": True,
             "updated_at": _now(),
             "ui_state_hash": _current_ui_state_hash(context or bpy.context),
-        }]})
+        }
+        if existing_data["tabs"]:
+            for tab in existing_data["tabs"]:
+                tab["is_active"] = False
+            existing_data["tabs"].append(new_tab)
+            _write_registry(existing_data)
+        else:
+            _write_registry({"tabs": [new_tab]})
     else:
         _write_registry({"tabs": []})
     _sync_registry_to_properties(context or bpy.context)
+    if current:
+        _mark_process_session_registered(context or bpy.context)
+
+
+def _ensure_startup_session():
+    global _startup_session_initialized, _startup_session_deadline
+    wm = _window_manager_from_context()
+    if wm is None or not hasattr(wm, "mbb_bookmarks"):
+        return 0.1
+    startup_phase = time.monotonic() < _startup_session_deadline
+    current = _current_blend_filepath()
+    data = _clean_registry(_read_registry())
+    if not _startup_session_initialized:
+        _initialize_new_window_session(bpy.context)
+    elif current:
+        _register_current_process_tab(is_active=True)
+        _sync_registry_to_properties(bpy.context)
+    elif startup_phase and data["tabs"]:
+        tab = next((item for item in reversed(data["tabs"]) if _is_untitled_tab(item)), data["tabs"][-1])
+        target = bpy.path.abspath(tab.get("cache_filepath", "") or tab.get("filepath", ""))
+        if not target:
+            target = _first_window_untitled_cache_path()
+        try:
+            _save_as_mainfile_resilient("EXEC_DEFAULT", filepath=target, copy=False, check_existing=False)
+        except Exception:
+            pass
+        _set_active_in_registry(tab.get("filepath", "") or target)
+        _sync_registry_to_properties(bpy.context)
+    elif not data["tabs"]:
+        _startup_session_initialized = False
+        _initialize_new_window_session(bpy.context)
+    else:
+        _sync_registry_to_properties(bpy.context)
+    if len(getattr(wm, "mbb_bookmarks", ())) == 0:
+        return 0.1
+    _mark_process_session_registered(bpy.context)
+    _request_view3d_redraw(bpy.context)
+    if startup_phase:
+        return min(0.2, max(0.01, _startup_session_deadline - time.monotonic()))
+    _startup_session_deadline = 0.0
+    return None
 
 
 def _clean_registry(data):
@@ -1728,20 +2090,21 @@ def _clean_registry(data):
         filepath = str(tab.get("filepath", ""))
         if not filepath:
             continue
-        key = bpy.path.abspath(filepath)
+        key = _normalized_path(filepath)
         if key in seen:
             continue
         seen.add(key)
 
         cache_filepath = str(tab.get("cache_filepath", ""))
         tab_id = str(tab.get("tab_id", "")) or _stable_tab_id_for_paths(filepath, cache_filepath)
+        title = _title_from_path(filepath) if _is_untitled_path(filepath) else (str(tab.get("title", "")) or _title_from_path(filepath))
         cleaned.append({
             "tab_id": tab_id,
             "filepath": filepath,
             "cache_filepath": cache_filepath,
             "thumbnail_filepath": str(tab.get("thumbnail_filepath", "")),
             "thumbnail_placeholder": bool(tab.get("thumbnail_placeholder", False)),
-            "title": str(tab.get("title", "")) or _title_from_path(filepath),
+            "title": title,
             "is_active": bool(tab.get("is_active", False)),
             "updated_at": float(tab.get("updated_at", _now())),
             "ui_state_hash": str(tab.get("ui_state_hash", "")),
@@ -1750,10 +2113,10 @@ def _clean_registry(data):
 
 
 def _set_active_in_registry(filepath):
-    target = bpy.path.abspath(filepath) if filepath else ""
+    target = _normalized_path(filepath)
     data = _clean_registry(_read_registry())
     for tab in data["tabs"]:
-        tab_path = bpy.path.abspath(tab["filepath"])
+        tab_path = _normalized_path(tab["filepath"])
         tab["is_active"] = bool(target and tab_path == target)
         tab["updated_at"] = _now()
     _write_registry(data)
@@ -1770,6 +2133,7 @@ def _upsert_registry_tab(
     thumbnail_placeholder=None,
 ):
     filepath = bpy.path.abspath(filepath) if filepath else ""
+    filepath_key = _normalized_path(filepath)
     if not filepath:
         return
 
@@ -1777,7 +2141,7 @@ def _upsert_registry_tab(
     found = False
 
     for tab in data["tabs"]:
-        if bpy.path.abspath(tab["filepath"]) == filepath:
+        if _normalized_path(tab["filepath"]) == filepath_key:
             tab["filepath"] = filepath
             if tab_id:
                 tab["tab_id"] = tab_id
@@ -1814,26 +2178,26 @@ def _upsert_registry_tab(
 
     if is_active:
         for tab in data["tabs"]:
-            tab["is_active"] = bpy.path.abspath(tab["filepath"]) == filepath
+            tab["is_active"] = _normalized_path(tab["filepath"]) == filepath_key
 
     _write_registry(data)
 
 
 def _remove_registry_tab(filepath):
-    target = bpy.path.abspath(filepath) if filepath else ""
+    target = _normalized_path(filepath)
     data = _clean_registry(_read_registry())
-    data["tabs"] = [tab for tab in data["tabs"] if bpy.path.abspath(tab["filepath"]) != target]
+    data["tabs"] = [tab for tab in data["tabs"] if _normalized_path(tab["filepath"]) != target]
     _write_registry(data)
 
 
 def _find_tab_by_any_path(filepath):
-    target = bpy.path.abspath(filepath) if filepath else ""
+    target = _normalized_path(filepath)
     if not target:
         return None
     for tab in _clean_registry(_read_registry())["tabs"]:
         paths = [tab["filepath"], tab.get("cache_filepath", "")]
         for path in paths:
-            if path and bpy.path.abspath(path) == target:
+            if path and _normalized_path(path) == target:
                 return tab
     return None
 
@@ -1871,11 +2235,11 @@ def _active_registry_tab():
 
 
 def _tab_matches_filepath(tab, filepath):
-    target = bpy.path.abspath(filepath) if filepath else ""
+    target = _normalized_path(filepath)
     if not tab or not target:
         return False
     for path in (tab.get("filepath", ""), tab.get("cache_filepath", "")):
-        if path and bpy.path.abspath(path) == target:
+        if path and _normalized_path(path) == target:
             return True
     return False
 
@@ -2423,8 +2787,9 @@ def _clean_overlay_state(state, fallback="NAMES"):
 
 
 def _read_overlay_state_file():
+    path = _overlay_state_path()
     try:
-        with open(OVERLAY_STATE_PATH, "r", encoding="utf-8") as handle:
+        with open(path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {"projects": {}, "legacy_area_states": []}
@@ -2466,11 +2831,12 @@ def _write_overlay_state_file(data):
         "updated_at": _now(),
     }
     try:
-        os.makedirs(os.path.dirname(OVERLAY_STATE_PATH), exist_ok=True)
-        temp_path = OVERLAY_STATE_PATH + ".tmp"
+        path = _overlay_state_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        temp_path = path + ".tmp"
         with open(temp_path, "w", encoding="utf-8") as handle:
             json.dump(safe_data, handle, ensure_ascii=False, indent=2)
-        os.replace(temp_path, OVERLAY_STATE_PATH)
+        os.replace(temp_path, path)
     except OSError:
         pass
 
@@ -2900,6 +3266,111 @@ def _default_relative_remap():
     return bool(getattr(prefs, "use_relative_paths", True)) if prefs else True
 
 
+def _recent_files_path():
+    try:
+        config_directory = bpy.utils.user_resource("CONFIG")
+    except Exception:
+        config_directory = ""
+    return os.path.join(config_directory, "recent-files.txt") if config_directory else ""
+
+
+def _add_paths_to_blender_recent_files(filepaths):
+    recent_path = _recent_files_path()
+    if not recent_path:
+        return
+    new_paths = []
+    seen = set()
+    for filepath in reversed(tuple(filepaths)):
+        path = bpy.path.abspath(filepath) if filepath else ""
+        key = os.path.normcase(path)
+        if not path or key in seen or not os.path.isfile(path) or not path.lower().endswith(".blend"):
+            continue
+        if _is_cache_file_path(path) or _is_untitled_path(path):
+            continue
+        seen.add(key)
+        new_paths.append(path)
+    try:
+        with open(recent_path, "r", encoding="utf-8") as handle:
+            existing_paths = [line.strip() for line in handle if line.strip()]
+    except OSError:
+        existing_paths = []
+    for path in existing_paths:
+        key = os.path.normcase(os.path.abspath(path))
+        if key not in seen:
+            seen.add(key)
+            new_paths.append(path)
+    prefs = _file_browser_preferences()
+    limit = max(1, int(getattr(prefs, "recent_files", 10))) if prefs else 10
+    try:
+        os.makedirs(os.path.dirname(recent_path), exist_ok=True)
+        temp_path = recent_path + ".tmp"
+        with open(temp_path, "w", encoding="utf-8", newline="") as handle:
+            handle.write("\n".join(new_paths[:limit]))
+            if new_paths:
+                handle.write("\n")
+        os.replace(temp_path, recent_path)
+        bpy.ops.wm.read_history()
+    except (OSError, RuntimeError):
+        pass
+
+
+def _foreground_autosave_key():
+    tab = _current_registry_tab()
+    if tab:
+        return str(tab.get("tab_id", "") or _stable_tab_id_for_paths(tab.get("filepath", ""), tab.get("cache_filepath", "")))
+    current = _current_blend_filepath()
+    return os.path.normcase(bpy.path.abspath(current)) if current else ""
+
+
+def _foreground_autosave_timer():
+    global _foreground_autosave_last_tick
+    now = time.monotonic()
+    previous = _foreground_autosave_last_tick
+    _foreground_autosave_last_tick = now
+    if bpy.app.background:
+        return 1.0
+    prefs = _file_browser_preferences()
+    if not prefs or not bool(getattr(prefs, "use_auto_save_temporary_files", False)):
+        return 1.0
+    interval_minutes = int(getattr(prefs, "auto_save_time", 0) or 0)
+    if interval_minutes <= 0:
+        return 1.0
+    key = _foreground_autosave_key()
+    if not key:
+        return 1.0
+    elapsed = max(0.0, min(now - previous, 5.0)) if previous else 0.0
+    accumulated = float(_foreground_autosave_seconds.get(key, 0.0)) + elapsed
+    threshold = float(interval_minutes * 60)
+    if accumulated < threshold:
+        _foreground_autosave_seconds[key] = accumulated
+        return 1.0
+    try:
+        result = bpy.ops.wm.save_auto_save()
+    except RuntimeError:
+        _foreground_autosave_seconds[key] = accumulated
+        return 1.0
+    if "FINISHED" in result:
+        accumulated %= threshold
+    _foreground_autosave_seconds[key] = accumulated
+    return 1.0
+
+
+def _start_foreground_autosave_timer():
+    global _foreground_autosave_last_tick
+    _foreground_autosave_last_tick = time.monotonic()
+    if bpy.app.background or bpy.app.timers.is_registered(_foreground_autosave_timer):
+        return
+    bpy.app.timers.register(_foreground_autosave_timer, first_interval=1.0, persistent=True)
+
+
+def _stop_foreground_autosave_timer():
+    if bpy.app.timers.is_registered(_foreground_autosave_timer):
+        try:
+            bpy.app.timers.unregister(_foreground_autosave_timer)
+        except ValueError:
+            pass
+
+
 def _open_mainfile_current_window(filepath, load_ui=True, use_scripts=False):
     # The operator defaults mirror Blender's File Paths preferences, while the
     # file browser panel can still override them for a single action.
@@ -3036,6 +3507,7 @@ def _open_blend_bookmark_paths(context, filepaths, load_ui=True, use_scripts=Fal
         return {"CANCELLED"}
 
     active_path = valid_paths[-1]
+    _add_paths_to_blender_recent_files(valid_paths)
     _remember_overlay_state(context=context)
     _save_current_project_to_cache(capture_thumbnail=True)
     for path in valid_paths:
@@ -4916,6 +5388,69 @@ def _draw_view3d_tab_bar():
         _draw_tab_tooltip(tooltip_tab, tooltip_anchor[0], tooltip_anchor[1], width, height)
 
 
+def _wake_overlay_router_for_cancel(context=None):
+    context = context or bpy.context
+    window = getattr(context, "window", None)
+    if window is None:
+        return
+    try:
+        window.event_simulate(type="MOUSEMOVE", value="NOTHING", x=0, y=0)
+    except (AttributeError, RuntimeError, TypeError):
+        pass
+
+
+def _stop_overlay_router_for_reload(context=None):
+    global _overlay_router_running
+    _overlay_router_running = False
+    _remove_overlay_draw_handler()
+    _wake_overlay_router_for_cancel(context)
+
+
+def _reload_scripts_when_router_stops(attempt=0):
+    global _reload_scripts_pending
+    if not _reload_scripts_pending:
+        return None
+    try:
+        bpy.ops.script.reload()
+        _reload_scripts_pending = False
+        return None
+    except RuntimeError as exc:
+        if attempt >= 20 or "modal" not in str(exc).lower():
+            _reload_scripts_pending = False
+            print(f"Multi Blender Bookmark could not reload scripts: {exc}")
+            _schedule_overlay_router_restart()
+            return None
+        _wake_overlay_router_for_cancel()
+        return 0.05
+
+
+class MBB_OT_reload_scripts(bpy.types.Operator):
+    bl_idname = "wm.mbb_reload_scripts"
+    bl_label = "Reload Scripts"
+    bl_description = "Reload scripts after closing the bookmark event router"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        global _reload_scripts_pending
+        if _reload_scripts_pending:
+            return {"CANCELLED"}
+        _reload_scripts_pending = True
+        _stop_overlay_router_for_reload(context)
+        attempts = {"count": 0}
+
+        def _retry():
+            attempt = attempts["count"]
+            attempts["count"] = attempt + 1
+            return _reload_scripts_when_router_stops(attempt)
+
+        try:
+            bpy.app.timers.register(_retry, first_interval=0.05)
+        except ValueError:
+            _reload_scripts_pending = False
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
 class MBB_OT_overlay_router(bpy.types.Operator):
     bl_idname = "wm.mbb_overlay_router"
     bl_label = "Multi Blender Bookmark Overlay Router"
@@ -4937,6 +5472,10 @@ class MBB_OT_overlay_router(bpy.types.Operator):
     def modal(self, context, event):
         global _overlay_mouse_abs, _overlay_absorb_leftmouse_release
         if not _overlay_router_running:
+            return {"CANCELLED"}
+
+        if event.type == "F8" and event.value == "PRESS":
+            bpy.ops.wm.mbb_reload_scripts()
             return {"CANCELLED"}
 
         if event.type in {"MOUSEMOVE", "LEFTMOUSE"}:
@@ -5007,6 +5546,8 @@ class MBB_OT_overlay_router(bpy.types.Operator):
 
 @persistent
 def _mbb_load_pre(_dummy):
+    global _foreground_autosave_last_tick
+    _foreground_autosave_last_tick = time.monotonic()
     _persist_overlay_state(bpy.context)
     _remember_overlay_state(context=bpy.context)
     _register_current_process_tab(is_active=False)
@@ -5025,8 +5566,11 @@ def _mbb_load_post(_dummy):
     wm = _window_manager_from_context()
     if wm is not None and hasattr(wm, "mbb_view_mode"):
         wm.mbb_view_mode = _overlay_view_mode_state
-    _register_current_process_tab(is_active=True)
-    _sync_registry_to_properties(bpy.context)
+    if time.monotonic() < _startup_session_deadline:
+        _ensure_startup_session()
+    else:
+        _register_current_process_tab(is_active=True)
+        _sync_registry_to_properties(bpy.context)
     _schedule_overlay_router_restart()
 
 
@@ -5147,6 +5691,7 @@ classes = (
     MBB_OT_next_bookmark,
     MBB_OT_prev_bookmark,
     MBB_OT_dock_shortcut,
+    MBB_OT_reload_scripts,
     MBB_OT_overlay_router,
 )
 
@@ -5172,6 +5717,12 @@ def _register_keymaps():
     if not kc:
         return
     km = kc.keymaps.new(name=KEYMAP_NAME, space_type=KEYMAP_SPACE_TYPE)
+    reload_item = km.keymap_items.new(
+        MBB_OT_reload_scripts.bl_idname,
+        "F8",
+        "PRESS",
+    )
+    addon_keymaps.append((km, reload_item))
     toggle_key, toggle_modifiers = _shortcut_parts(_shortcut_value("shortcut_toggle_bar"))
     if toggle_key:
         kmi = km.keymap_items.new(
@@ -5253,12 +5804,43 @@ def _remove_overlay_draw_handler():
     _overlay_draw_handler = None
 
 
+def _draw_system_menu_with_bookmark_reload(self, _context):
+    layout = self.layout
+    layout.operator(MBB_OT_reload_scripts.bl_idname)
+    layout.separator()
+    layout.operator("wm.memory_statistics")
+    layout.operator("wm.debug_menu")
+    layout.operator_menu_enum("wm.redraw_timer", "type")
+    layout.separator()
+    layout.operator("screen.spacedata_cleanup")
+    layout.operator("wm.operator_presets_cleanup")
+
+
+def _install_system_menu_reload():
+    global _original_system_menu_draw
+    menu = getattr(bpy.types, "TOPBAR_MT_blender_system", None)
+    if menu is None or _original_system_menu_draw is not None:
+        return
+    _original_system_menu_draw = menu.draw
+    menu.draw = _draw_system_menu_with_bookmark_reload
+
+
+def _remove_system_menu_reload():
+    global _original_system_menu_draw
+    menu = getattr(bpy.types, "TOPBAR_MT_blender_system", None)
+    if menu is not None and _original_system_menu_draw is not None:
+        menu.draw = _original_system_menu_draw
+    _original_system_menu_draw = None
+
+
 def register():
+    global _startup_session_initialized, _startup_session_deadline
     _register_translations()
 
     for cls in classes:
         bpy.utils.register_class(cls)
     _register_theme_color_source_menus()
+    _migrate_cache_layout()
 
     bpy.types.WindowManager.mbb_bookmarks = CollectionProperty(type=MBB_BookmarkItem)
     bpy.types.WindowManager.mbb_view_mode = EnumProperty(
@@ -5271,10 +5853,23 @@ def register():
         default="NAMES",
     )
 
+    existing_data = _clean_registry(_read_registry())
+    resuming_process = _process_session_is_registered(bpy.context) and bool(existing_data["tabs"])
+    if resuming_process:
+        _startup_session_initialized = True
+        _startup_session_deadline = 0.0
+        current_tab = _find_tab_by_any_path(_current_blend_filepath())
+        resume_tab = current_tab or _active_registry_tab() or existing_data["tabs"][-1]
+        _set_active_in_registry(resume_tab.get("filepath", ""))
+        _sync_registry_to_properties(bpy.context)
+    else:
+        _startup_session_initialized = False
+        _startup_session_deadline = time.monotonic() + 2.0
+
     _initialize_overlay_state_from_disk(bpy.context)
-    _initialize_new_window_session(bpy.context)
     _register_keymaps()
     _install_header_toggle()
+    _install_system_menu_reload()
     if _use_plugin_drop_panel():
         _install_drop_blend_patch()
     else:
@@ -5286,8 +5881,15 @@ def register():
         bpy.app.handlers.load_post.append(_mbb_load_post)
     if _mbb_save_post not in bpy.app.handlers.save_post:
         bpy.app.handlers.save_post.append(_mbb_save_post)
-    if not bpy.app.background:
+    if bpy.app.background or resuming_process:
+        _ensure_startup_session()
+    else:
+        try:
+            bpy.app.timers.register(_ensure_startup_session, first_interval=0.25)
+        except ValueError:
+            pass
         bpy.app.timers.register(_start_overlay_router, first_interval=0.2)
+        _start_foreground_autosave_timer()
 
 
 def unregister():
@@ -5303,7 +5905,14 @@ def unregister():
     _thumbnail_textures.clear()
     _remove_overlay_draw_handler()
     _remove_header_toggle()
+    _remove_system_menu_reload()
     _remove_drop_blend_patch()
+    _stop_foreground_autosave_timer()
+    if bpy.app.timers.is_registered(_ensure_startup_session):
+        try:
+            bpy.app.timers.unregister(_ensure_startup_session)
+        except ValueError:
+            pass
 
     if _mbb_load_pre in bpy.app.handlers.load_pre:
         bpy.app.handlers.load_pre.remove(_mbb_load_pre)
