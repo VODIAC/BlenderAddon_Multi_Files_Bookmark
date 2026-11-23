@@ -1,14 +1,13 @@
 ﻿# Multi Files Bookmark
 #
-# Blender keeps one active .blend data-base per process. This add-on stays
-# inside the current Blender window and switches projects with open_mainfile().
-# Before switching away, it writes a copy of the current project to Blender's
-# user cache directory. Switching back opens that cache copy, so unsaved edits
-# survive without touching the original .blend file.
+# Single-process mode switches projects by reopening a working cache.
+# On Windows, resident mode keeps one Blender process per loaded project and
+# switches its window to the foreground without reloading the project.
 
 import json
 import math
 import os
+import re
 import hashlib
 import shutil
 import tempfile
@@ -25,6 +24,7 @@ from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatPrope
 from gpu_extras.batch import batch_for_shader
 
 from .translation import TRANSLATIONS, theme_path_labels
+from . import project_processes as processes
 
 
 ADDON_ID = "multi_blender_bookmark"
@@ -36,6 +36,13 @@ PANEL_COLOR_FOLDER_NAME = "panelcolor"
 STATE_FOLDER_NAME = "state"
 DEFAULT_STATE_DIR = os.path.join(DEFAULT_CACHE_DIR, STATE_FOLDER_NAME)
 SESSION_ID = f"pid_{os.getpid()}"
+LIVE_MODE_LABEL = "Use Multiple Processes to Preserve Undo History"
+LIVE_MODE_DESCRIPTION = (
+    "Keep each project's undo and redo history in its own Blender process. "
+    "When disabled, switching reloads the cached file and uses fewer processes, "
+    "but undo history is unavailable after switching projects. "
+    "Turning this off takes effect the next time you start Blender"
+)
 PROCESS_SESSION_MARKER = "_multi_blender_bookmark_session_id"
 LEGACY_REGISTRY_PATH = os.path.join(tempfile.gettempdir(), "multi_blender_bookmark.json")
 UI_COLOR_PRESETS_FILENAME = "multi_blender_bookmark_ui_color_presets.json"
@@ -141,7 +148,15 @@ _sdf_line_shader = None
 _sdf_shader_warning_printed = False
 _foreground_autosave_seconds = {}
 _foreground_autosave_last_tick = 0.0
+_foreground_autosave_active_key = ""
+_saving_registry_tab = None
+_saving_recent_files = None
 _reload_scripts_pending = False
+_live_group = None
+_live_transition = None
+_live_booting = False
+_live_binding = False
+_live_closing = False
 
 SHORTCUT_DEFAULTS = {
     "shortcut_new_file": "CTRL T",
@@ -391,6 +406,8 @@ def _mark_process_session_registered(context=None):
 
 
 def _cache_dir():
+    if _live_group:
+        return _live_group.config["cache"]
     prefs = _addon_preferences()
     if prefs and hasattr(prefs, "cache_directory") and prefs.cache_directory:
         path = bpy.path.abspath(prefs.cache_directory)
@@ -430,10 +447,14 @@ def _state_dir(cache_directory=None):
 
 
 def _registry_path(cache_directory=None):
+    if _live_group and cache_directory is None:
+        return _live_group.config["registry"]
     return os.path.join(_state_dir(cache_directory), f"multi_blender_bookmark_{SESSION_ID}.json")
 
 
 def _overlay_state_path(cache_directory=None):
+    if _live_group and cache_directory is None:
+        return str(_live_group.directory / f"overlay-{_live_group.tab_id}.json")
     return os.path.join(_state_dir(cache_directory), "multi_blender_bookmark_overlay_state.json")
 
 
@@ -1338,6 +1359,8 @@ def _update_active_ui_color_preset(self, context=None):
 
 
 def _update_cache_directory(self, _context=None):
+    if _live_group:
+        return
     old_dir = bpy.path.abspath(getattr(self, "ui_color_presets_cache_directory", "") or DEFAULT_CACHE_DIR)
     new_dir = bpy.path.abspath(getattr(self, "cache_directory", "") or DEFAULT_CACHE_DIR)
     _migrate_cache_directory_contents(old_dir, new_dir)
@@ -1644,7 +1667,7 @@ def _render_transparent_view_thumbnail(filepath):
         return ""
 
     thumb_path = _thumbnail_path_for(filepath)
-    preview_path = os.path.join(_cache_dir(), "_viewport_preview_tmp.png")
+    preview_path = os.path.join(_screenshot_dir(), f"preview_tmp_{SESSION_ID}.png")
     scene = bpy.context.scene
     render = scene.render
     old_filepath = render.filepath
@@ -1814,6 +1837,9 @@ def _write_registry(data):
     path = _registry_path()
     safe_data = {"tabs": data.get("tabs", [])}
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    if _live_group:
+        processes.write(path, safe_data)
+        return
     temp_path = path + ".tmp"
     with open(temp_path, "w", encoding="utf-8") as handle:
         json.dump(safe_data, handle, ensure_ascii=False, indent=2)
@@ -2000,6 +2026,7 @@ def _initialize_new_window_session(context=None):
     _closed_tab_history = []
     existing_data = _clean_registry(_read_registry())
     current = _current_blend_filepath()
+    logical_path = current
     if existing_data["tabs"] and current:
         _register_current_process_tab(is_active=True)
         _sync_registry_to_properties(context or bpy.context)
@@ -2007,6 +2034,10 @@ def _initialize_new_window_session(context=None):
 
     if not current:
         current = _next_untitled_cache_path() if existing_data["tabs"] else _first_window_untitled_cache_path()
+        logical_path = current
+        prefs = _addon_preferences()
+        if not bpy.app.background and processes.SUPPORTED and prefs and prefs.use_live_projects:
+            current = _live_cache_path({"filepath": logical_path})
         try:
             _save_as_mainfile_resilient("EXEC_DEFAULT", filepath=current, copy=False, check_existing=False)
         except Exception:
@@ -2014,11 +2045,11 @@ def _initialize_new_window_session(context=None):
     if current:
         current = bpy.path.abspath(current)
         original_tab = _latest_original_tab_for_cache(current) if _is_cache_file_path(current) else None
-        filepath = bpy.path.abspath(original_tab.get("filepath", "")) if original_tab else current
+        filepath = bpy.path.abspath(original_tab.get("filepath", "")) if original_tab else logical_path
         cache_filepath = current if original_tab else current
         tab_id = original_tab.get("tab_id", "") if original_tab else ""
         thumbnail_filepath = original_tab.get("thumbnail_filepath", "") if original_tab else ""
-        thumbnail_placeholder = bool(original_tab.get("thumbnail_placeholder", False)) if original_tab else _is_untitled_path(current)
+        thumbnail_placeholder = bool(original_tab.get("thumbnail_placeholder", False)) if original_tab else _is_untitled_path(filepath)
         new_tab = {
             "tab_id": tab_id or (_new_tab_id() if _is_untitled_path(filepath) else _stable_tab_id_for_paths(filepath, cache_filepath)),
             "filepath": filepath,
@@ -2113,6 +2144,7 @@ def _clean_registry(data):
 
 
 def _set_active_in_registry(filepath):
+    _account_foreground_autosave_time()
     target = _normalized_path(filepath)
     data = _clean_registry(_read_registry())
     for tab in data["tabs"]:
@@ -2203,11 +2235,12 @@ def _find_tab_by_any_path(filepath):
 
 
 def _is_cache_file_path(filepath):
-    filepath = bpy.path.abspath(filepath) if filepath else ""
+    filepath = _normalized_path(filepath)
     if not filepath:
         return False
     try:
-        return os.path.commonpath([filepath, bpy.path.abspath(_cache_dir())]) == bpy.path.abspath(_cache_dir())
+        cache_directory = _normalized_path(_cache_dir())
+        return os.path.commonpath([filepath, cache_directory]) == cache_directory
     except (OSError, ValueError):
         return False
 
@@ -2222,7 +2255,7 @@ def _manual_save_target_from_tab(tab, current=""):
         return ""
     if cache_path and bpy.path.abspath(original) == cache_path:
         return ""
-    if _is_untitled_path(original) or _is_cache_file_path(original):
+    if _is_cache_file_path(original) or (_is_untitled_path(original) and not _live_group):
         return ""
     return original
 
@@ -2290,7 +2323,10 @@ def _save_current_project_to_cache(force=False, capture_thumbnail=False):
         tab = active_tab
     original = tab["filepath"] if tab else current
     cache_path = _cache_path_for(original)
-    if tab and tab.get("cache_filepath") and bpy.path.abspath(tab["filepath"]) == bpy.path.abspath(tab["cache_filepath"]):
+    # Reuse the live cache after an untitled project acquires an original
+    # filename. Moving its cache while copy=True leaves bpy.data.filepath at
+    # the old location, so load_pre would mistake it for another project.
+    if tab and tab.get("cache_filepath") and _is_cache_file_path(tab["cache_filepath"]):
         cache_path = bpy.path.abspath(tab["cache_filepath"])
 
     ui_state_hash = _current_ui_state_hash(bpy.context)
@@ -2459,7 +2495,7 @@ def _sync_registry_to_properties(context):
         tab.thumbnail_filepath = tab_data.get("thumbnail_filepath", "")
         tab.thumbnail_placeholder = bool(tab_data.get("thumbnail_placeholder", False))
         tab.title = tab_data["title"]
-        tab.is_active = bool(tab_data["is_active"])
+        tab.is_active = (tab.tab_id == _live_group.tab_id) if _live_group else bool(tab_data["is_active"])
     _prune_selection(len(wm.mbb_bookmarks))
 
 
@@ -2677,6 +2713,12 @@ class MBB_AddonPreferences(bpy.types.AddonPreferences):
         name="Show File Path on Hover",
         description="Show the original file path while hovering a bookmark tab",
         default=True,
+    )
+    use_live_projects: BoolProperty(
+        name=LIVE_MODE_LABEL,
+        description=LIVE_MODE_DESCRIPTION,
+        default=False,
+        update=lambda _self, _context: _update_live_preference(),
     )
     use_plugin_drop_panel: BoolProperty(
         name="Use Plugin Panel When Dropping Files Into Blender to Support Multiple Files",
@@ -3274,7 +3316,39 @@ def _recent_files_path():
     return os.path.join(config_directory, "recent-files.txt") if config_directory else ""
 
 
-def _add_paths_to_blender_recent_files(filepaths):
+def _read_blender_recent_files():
+    try:
+        with open(_recent_files_path(), "r", encoding="utf-8") as handle:
+            return [line.strip() for line in handle if line.strip()]
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return None
+
+
+def _write_blender_recent_files(filepaths):
+    recent_path = _recent_files_path()
+    if not recent_path:
+        return
+    try:
+        os.makedirs(os.path.dirname(recent_path), exist_ok=True)
+        if _live_group:
+            text = "".join(f"{path}\n" for path in filepaths)
+            processes.write_text(recent_path, text)
+            bpy.ops.wm.read_history()
+            return
+        temp_path = recent_path + ".tmp"
+        with open(temp_path, "w", encoding="utf-8", newline="") as handle:
+            handle.write("\n".join(filepaths))
+            if filepaths:
+                handle.write("\n")
+        os.replace(temp_path, recent_path)
+        bpy.ops.wm.read_history()
+    except (OSError, RuntimeError):
+        pass
+
+
+def _add_paths_to_blender_recent_files(filepaths, include_cache=False):
     recent_path = _recent_files_path()
     if not recent_path:
         return
@@ -3285,15 +3359,13 @@ def _add_paths_to_blender_recent_files(filepaths):
         key = os.path.normcase(path)
         if not path or key in seen or not os.path.isfile(path) or not path.lower().endswith(".blend"):
             continue
-        if _is_cache_file_path(path) or _is_untitled_path(path):
+        if not include_cache and _is_cache_file_path(path):
             continue
         seen.add(key)
         new_paths.append(path)
-    try:
-        with open(recent_path, "r", encoding="utf-8") as handle:
-            existing_paths = [line.strip() for line in handle if line.strip()]
-    except OSError:
-        existing_paths = []
+    if not new_paths:
+        return
+    existing_paths = _read_blender_recent_files() or []
     for path in existing_paths:
         key = os.path.normcase(os.path.abspath(path))
         if key not in seen:
@@ -3301,17 +3373,7 @@ def _add_paths_to_blender_recent_files(filepaths):
             new_paths.append(path)
     prefs = _file_browser_preferences()
     limit = max(1, int(getattr(prefs, "recent_files", 10))) if prefs else 10
-    try:
-        os.makedirs(os.path.dirname(recent_path), exist_ok=True)
-        temp_path = recent_path + ".tmp"
-        with open(temp_path, "w", encoding="utf-8", newline="") as handle:
-            handle.write("\n".join(new_paths[:limit]))
-            if new_paths:
-                handle.write("\n")
-        os.replace(temp_path, recent_path)
-        bpy.ops.wm.read_history()
-    except (OSError, RuntimeError):
-        pass
+    _write_blender_recent_files(new_paths[:limit])
 
 
 def _foreground_autosave_key():
@@ -3322,27 +3384,52 @@ def _foreground_autosave_key():
     return os.path.normcase(bpy.path.abspath(current)) if current else ""
 
 
-def _foreground_autosave_timer():
+def _account_foreground_autosave_time():
     global _foreground_autosave_last_tick
+    if _live_group:
+        return
     now = time.monotonic()
     previous = _foreground_autosave_last_tick
     _foreground_autosave_last_tick = now
+    prefs = _file_browser_preferences()
+    if previous and _foreground_autosave_active_key and prefs and prefs.use_auto_save_temporary_files:
+        key = _foreground_autosave_active_key
+        _foreground_autosave_seconds[key] = _foreground_autosave_seconds.get(key, 0.0) + max(0.0, now - previous)
+
+
+def _foreground_autosave_can_save():
+    # The dock's permanent event router is safe. Defer while a transform,
+    # sculpt stroke, file selector, or another modal operation is in progress.
+    wm = _window_manager_from_context()
+    if wm is None or bpy.app.is_job_running("RENDER"):
+        return False
+    for window in wm.windows:
+        for operator in getattr(window, "modal_operators", ()):
+            if operator.bl_idname not in {"WM_OT_mbb_overlay_router", "wm.mbb_overlay_router"}:
+                return False
+    return True
+
+
+def _foreground_autosave_timer():
+    global _foreground_autosave_active_key, _foreground_autosave_last_tick
+    if _live_group:
+        return None
     if bpy.app.background:
         return 1.0
+    _account_foreground_autosave_time()
+    key = _foreground_autosave_key()
+    _foreground_autosave_active_key = key
     prefs = _file_browser_preferences()
     if not prefs or not bool(getattr(prefs, "use_auto_save_temporary_files", False)):
         return 1.0
     interval_minutes = int(getattr(prefs, "auto_save_time", 0) or 0)
     if interval_minutes <= 0:
         return 1.0
-    key = _foreground_autosave_key()
     if not key:
         return 1.0
-    elapsed = max(0.0, min(now - previous, 5.0)) if previous else 0.0
-    accumulated = float(_foreground_autosave_seconds.get(key, 0.0)) + elapsed
+    accumulated = float(_foreground_autosave_seconds.get(key, 0.0))
     threshold = float(interval_minutes * 60)
-    if accumulated < threshold:
-        _foreground_autosave_seconds[key] = accumulated
+    if accumulated < threshold or not _foreground_autosave_can_save():
         return 1.0
     try:
         result = bpy.ops.wm.save_auto_save()
@@ -3350,20 +3437,27 @@ def _foreground_autosave_timer():
         _foreground_autosave_seconds[key] = accumulated
         return 1.0
     if "FINISHED" in result:
-        accumulated %= threshold
+        accumulated = 0.0
     _foreground_autosave_seconds[key] = accumulated
+    _foreground_autosave_last_tick = time.monotonic()
     return 1.0
 
 
 def _start_foreground_autosave_timer():
-    global _foreground_autosave_last_tick
+    global _foreground_autosave_last_tick, _foreground_autosave_active_key
+    if _live_group:
+        return
     _foreground_autosave_last_tick = time.monotonic()
+    _foreground_autosave_active_key = _foreground_autosave_key()
     if bpy.app.background or bpy.app.timers.is_registered(_foreground_autosave_timer):
         return
     bpy.app.timers.register(_foreground_autosave_timer, first_interval=1.0, persistent=True)
 
 
 def _stop_foreground_autosave_timer():
+    global _foreground_autosave_last_tick, _foreground_autosave_active_key
+    _foreground_autosave_last_tick = 0.0
+    _foreground_autosave_active_key = ""
     if bpy.app.timers.is_registered(_foreground_autosave_timer):
         try:
             bpy.app.timers.unregister(_foreground_autosave_timer)
@@ -3422,6 +3516,8 @@ def _defer_ui_action(action):
 
 
 def _restore_closed_impl(context):
+    if _live_group:
+        return _restore_live_tabs(context)
     global _last_closed_tabs
     restored = []
     data = _clean_registry(_read_registry())
@@ -3468,6 +3564,434 @@ def _execute_or_defer(action):
     return {"FINISHED"}
 
 
+def _live_tab(tab_id):
+    return next((tab for tab in _clean_registry(_read_registry())["tabs"] if tab["tab_id"] == tab_id), None)
+
+
+def _live_cache_path(tab):
+    name = _safe_filename_part(os.path.basename(tab["filepath"]) or "Untitled.blend")
+    return os.path.join(_cache_dir(), f"mbb_{uuid.uuid4().hex}_{name}")
+
+
+def _save_live_cache(path, copy=False):
+    global _live_binding
+    _live_binding = True
+    try:
+        result = _save_as_mainfile_resilient(
+            "EXEC_DEFAULT", filepath=path, copy=copy, check_existing=False, relative_remap=True,
+        )
+        if "FINISHED" not in result or not os.path.isfile(path):
+            raise RuntimeError("Could not save the project's working cache")
+    finally:
+        _live_binding = False
+
+
+def _bind_live_cache(tab, path=None):
+    path = path or _live_cache_path(tab)
+    recent = _read_blender_recent_files()
+    try:
+        _save_live_cache(path)
+    finally:
+        _remove_live_recent_paths([path], recent)
+    _upsert_registry_tab(
+        tab["filepath"], tab["title"], cache_filepath=path, tab_id=tab["tab_id"],
+        thumbnail_placeholder=tab.get("thumbnail_placeholder", False),
+        ui_state_hash=_current_ui_state_hash(bpy.context), is_active=True,
+    )
+
+
+def _live_tab_for_path(path, untitled=False):
+    return {
+        "tab_id": _new_tab_id(), "filepath": path, "title": _title_from_path(path),
+        "thumbnail_placeholder": untitled, "cache_filepath": "",
+    }
+
+
+def _update_live_preference():
+    if bpy.app.background or not processes.SUPPORTED or _live_group:
+        return
+    if not bpy.app.timers.is_registered(_enable_live_group):
+        bpy.app.timers.register(_enable_live_group, first_interval=0.05)
+
+
+def _enable_live_group():
+    global _live_group
+    prefs = _addon_preferences()
+    if _live_group or not prefs or not prefs.use_live_projects or not processes.SUPPORTED or bpy.app.background:
+        return None
+    if not _foreground_autosave_can_save() or not processes.windows(os.getpid()):
+        return 0.25
+    tab = _current_registry_tab()
+    if not tab:
+        _ensure_startup_session()
+        tab = _current_registry_tab()
+    if not tab:
+        return None
+    try:
+        overlay = _state_for_overlay_handoff(context=bpy.context)
+        if not _is_resident_cache(tab.get("cache_filepath")) or _normalized_path(tab["cache_filepath"]) != _normalized_path(_current_blend_filepath()):
+            _bind_live_cache(tab)
+        _live_group = processes.Group.create(tab["tab_id"], _registry_path(), _cache_dir())
+        _live_group.publish()
+        _live_group.write("active", {"tab_id": tab["tab_id"]})
+        if _closed_tab_history:
+            _live_group.write("closed", {"tabs": _closed_tab_history})
+        _live_group.write(f"overlay-handoff-{tab['tab_id']}", {"state": overlay})
+        _start_live_runtime()
+    except (OSError, RuntimeError) as exc:
+        print(f"Multi Files Bookmark: could not enable live projects: {exc}")
+    return None
+
+
+def _start_live_runtime():
+    global _overlay_router_running
+    _overlay_router_running = False
+    _wake_overlay_router_for_cancel()
+    _stop_foreground_autosave_timer()
+    _schedule_overlay_router_restart()
+    _sync_registry_to_properties(bpy.context)
+    if not bpy.app.timers.is_registered(_live_tick):
+        bpy.app.timers.register(_live_tick, first_interval=0.1, persistent=True)
+
+
+def _resume_live_runtime():
+    _start_live_runtime()
+    return None
+
+
+def _live_switch_ready(tab_id, overlay):
+    pid, hwnds = _live_group.ready(tab_id)
+    if not hwnds:
+        return False
+    if tab_id != _live_group.tab_id:
+        if processes.foreground_pid() != pid:
+            return False
+        _live_group.write(f"overlay-handoff-{tab_id}", {"state": overlay})
+        _live_group.write("active", {"tab_id": tab_id})
+        if processes.foreground_pid() == pid:
+            processes.hide(processes.windows(os.getpid()))
+    return True
+
+
+def _is_resident_cache(path):
+    return bool(path and re.fullmatch(r"mbb_[0-9a-f]{32}_.+\.blend", os.path.basename(path), re.IGNORECASE)
+                and _is_cache_file_path(path))
+
+
+def _switch_live_tab(tab_id, load_ui=None, use_scripts=None, closing=None):
+    global _live_transition, _pending_overlay_state
+    if _live_transition or not _live_group or _live_closing:
+        return {"CANCELLED"}
+    tab = _live_tab(tab_id)
+    if not tab or not _foreground_autosave_can_save():
+        return {"CANCELLED"}
+    overlay = _remember_overlay_state(context=bpy.context)
+    _pending_overlay_state = ""
+    if tab_id == _live_group.tab_id:
+        return {"FINISHED"}
+    if _live_group.read(f"close-{tab_id}"):
+        return {"CANCELLED"}
+    options = _live_group.read(f"options-{tab_id}")
+    if load_ui is None:
+        load_ui = options.get("load_ui", True)
+    if use_scripts is None:
+        use_scripts = options.get("use_scripts", False)
+    current = _live_tab(_live_group.tab_id)
+    if current and not bpy.app.background:
+        _capture_current_thumbnail(current["filepath"], force=True)
+    if _live_group.ready(tab_id)[1]:
+        _live_transition = (tab_id, overlay, time.monotonic() + 2, closing, None)
+        return {"FINISHED"}
+    source = _existing_target_for_tab(tab)
+    untitled = not source and _is_untitled_tab(tab)
+    if not source and not untitled:
+        return {"CANCELLED"}
+    try:
+        layout = ""
+        if not load_ui and source:
+            if current and current.get("cache_filepath") and _is_cache_file_path(current["cache_filepath"]):
+                layout = current["cache_filepath"]
+                _save_live_cache(layout, copy=True)
+        prefs = _addon_preferences()
+        pref_values = {}
+        if prefs:
+            for prop in prefs.bl_rna.properties:
+                if prop.is_readonly or prop.identifier == "active_ui_color_preset" or prop.type not in {"BOOLEAN", "ENUM", "STRING", "INT", "FLOAT"}:
+                    continue
+                value = getattr(prefs, prop.identifier)
+                pref_values[prop.identifier] = list(value) if getattr(prop, "is_array", False) else value
+        settings = _file_browser_preferences()
+        child = _live_group.launch(bpy.app.binary_path, ADDON_MODULE, tab_id, {
+            "source": source, "layout": layout, "cache": (
+                source if _is_resident_cache(source) and _normalized_path(source) == _normalized_path(tab["cache_filepath"])
+                else _live_cache_path(tab)
+            ),
+            "load_ui": bool(load_ui), "use_scripts": bool(use_scripts), "overlay": overlay,
+            "preferences": pref_values, "autosave": [settings.use_auto_save_temporary_files, settings.auto_save_time],
+            "temporary_directory": settings.temporary_directory,
+            "recent": _read_blender_recent_files(),
+        })
+        _live_transition = (tab_id, overlay, time.monotonic() + 90, closing, child)
+        return {"FINISHED"}
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"Multi Files Bookmark: could not open resident project: {exc}")
+        return {"CANCELLED"}
+
+
+def _add_live_tab(tab):
+    _upsert_registry_tab(
+        tab["filepath"], tab["title"], cache_filepath=tab.get("cache_filepath") or None,
+        tab_id=tab["tab_id"], thumbnail_placeholder=tab.get("thumbnail_placeholder", False),
+    )
+
+
+def _open_live_paths(context, paths, load_ui, use_scripts):
+    if _live_transition:
+        return {"CANCELLED"}
+    target = None
+    for path in paths:
+        target = _find_tab_by_any_path(path)
+        if target is None:
+            target = _live_tab_for_path(path)
+            _add_live_tab(target)
+        _live_group.write(f"options-{target['tab_id']}", {"load_ui": load_ui, "use_scripts": use_scripts})
+    _add_paths_to_blender_recent_files(paths, include_cache=True)
+    _sync_registry_to_properties(context)
+    return _switch_live_tab(target["tab_id"], load_ui, use_scripts)
+
+
+def _new_live_tab(context, closing=None):
+    if _live_transition:
+        return {"CANCELLED"}
+    tab = _live_tab_for_path(_next_untitled_cache_path(), untitled=True)
+    _add_live_tab(tab)
+    _sync_registry_to_properties(context)
+    result = _switch_live_tab(tab["tab_id"], closing=closing)
+    if "CANCELLED" in result:
+        _remove_registry_tab(tab["filepath"])
+        _sync_registry_to_properties(context)
+    return result
+
+
+def _close_live_tabs(ids):
+    if _live_transition or _live_closing or not _foreground_autosave_can_save():
+        return {"CANCELLED"}
+    tabs = _clean_registry(_read_registry())["tabs"]
+    closing = [tab for tab in tabs if tab["tab_id"] in ids]
+    if not closing:
+        return {"CANCELLED"}
+    if _live_group.tab_id not in ids:
+        _finish_live_close(closing)
+        return {"FINISHED"}
+    active = next(i for i, tab in enumerate(tabs) if tab["tab_id"] == _live_group.tab_id)
+    fallback = _next_remaining_tab_after_close(tabs, {i for i, tab in enumerate(tabs) if tab["tab_id"] in ids}, active)
+    if fallback:
+        return _switch_live_tab(fallback["tab_id"], closing=closing)
+    return _new_live_tab(bpy.context, closing=closing)
+
+
+def _finish_live_close(closing):
+    history = _live_group.read("closed").get("tabs", [])
+    history.append(closing)
+    _live_group.write("closed", {"tabs": history[-100:]})
+    for tab in closing:
+        if _live_group.ready(tab["tab_id"])[1]:
+            _live_group.write(f"close-{tab['tab_id']}", {"tab": tab})
+    data = _clean_registry(_read_registry())
+    ids = {tab["tab_id"] for tab in closing}
+    _write_registry({"tabs": [tab for tab in data["tabs"] if tab["tab_id"] not in ids]})
+    _sync_registry_to_properties(bpy.context)
+    _selected_bookmark_indices.clear()
+
+
+def _restore_live_tabs(context):
+    if _live_transition or _live_closing:
+        return {"CANCELLED"}
+    history = _live_group.read("closed").get("tabs", [])
+    restored = []
+    while history and not restored:
+        for tab in history.pop():
+            if _live_group.read(f"close-{tab['tab_id']}"):
+                history.append([tab])
+                _live_group.write("closed", {"tabs": history})
+                return {"CANCELLED"}
+            if not _find_tab_by_any_path(tab["filepath"]) and _existing_target_for_tab(tab):
+                _add_live_tab(tab)
+                restored.append(tab)
+    _live_group.write("closed", {"tabs": history})
+    if not restored:
+        return {"CANCELLED"}
+    _sync_registry_to_properties(context)
+    return _switch_live_tab(restored[-1]["tab_id"], _default_load_ui(), _default_trusted_source())
+
+
+def _start_live_worker():
+    global _live_booting, _pending_overlay_state
+    group = _live_group
+    if not group:
+        raise RuntimeError("Missing live project group")
+    job = group.read(f"job-{group.tab_id}")
+    tab = _live_tab(group.tab_id)
+    if not job or not tab:
+        raise RuntimeError("Missing live project launch data")
+    try:
+        bpy.context.preferences.use_preferences_save = False
+        prefs = _addon_preferences()
+        if prefs:
+            for name, value in job.get("preferences", {}).items():
+                if name != "cache_directory":
+                    setattr(prefs, name, value)
+            _unregister_keymaps()
+            _register_keymaps()
+            _update_drop_panel_preference(prefs)
+        settings = _file_browser_preferences()
+        if settings and job.get("autosave"):
+            settings.use_auto_save_temporary_files, settings.auto_save_time = job["autosave"]
+            settings.temporary_directory = job.get("temporary_directory", settings.temporary_directory)
+        if job.get("layout"):
+            if "FINISHED" not in _open_mainfile_current_window(job["layout"], use_scripts=False):
+                raise RuntimeError("Could not read the working layout")
+        if job.get("source"):
+            result = _open_mainfile_current_window(job["source"], job["load_ui"], job["use_scripts"])
+            if "FINISHED" not in result:
+                raise RuntimeError("Could not read the source project")
+        if _normalized_path(_current_blend_filepath()) != _normalized_path(job["cache"]):
+            _bind_live_cache(tab, job["cache"])
+        _remove_live_recent_paths([job.get("layout"), job.get("source"), job["cache"]], job.get("recent"))
+        _pending_overlay_state = job["overlay"]
+        _initialize_overlay_state_from_disk()
+        _live_booting = False
+        group.forget(f"job-{group.tab_id}")
+        _start_live_runtime()
+        _schedule_overlay_router_restart()
+    except Exception as exc:
+        group.write(f"result-{group.tab_id}", {"error": str(exc)})
+        raise
+
+
+def _live_tick():
+    global _live_transition, _live_closing, _overlay_mouse_abs
+    group = _live_group
+    if not group or _live_closing:
+        return None
+    if _live_booting:
+        return 0.1
+    group.children = {key: child for key, child in group.children.items() if child.poll() is None}
+    if not group.ready(group.tab_id)[1] and not group.publish():
+        return 0.1
+    if _live_transition:
+        tab_id, overlay, deadline, closing, child = _live_transition
+        pid, hwnds = group.ready(tab_id)
+        if hwnds:
+            if child is not None:
+                deadline = min(deadline, time.monotonic() + 2)
+                _live_transition = (tab_id, overlay, deadline, closing, None)
+            if processes.foreground_pid() in {0, os.getpid()}:
+                processes.focus(hwnds)
+            if _live_switch_ready(tab_id, overlay):
+                _live_transition = None
+                if closing:
+                    _finish_live_close(closing)
+            elif time.monotonic() >= deadline:
+                _live_transition = None
+                processes.reveal(hwnds)
+                print("Multi Files Bookmark: Windows did not activate the project window")
+        elif time.monotonic() >= deadline or group.read(f"result-{tab_id}").get("error") or (child and child.poll() is not None):
+            _live_transition = None
+            group.reveal_all()
+            print(f"Multi Files Bookmark: project did not start: {group.read(f'result-{tab_id}').get('error', tab_id)}")
+    close_request = group.read(f"close-{group.tab_id}")
+    if close_request and _foreground_autosave_can_save():
+        tab = close_request["tab"]
+        try:
+            recent = _read_blender_recent_files()
+            _save_live_cache(tab["cache_filepath"])
+            _remove_live_recent_paths([tab["cache_filepath"]], recent)
+            group.forget(f"close-{group.tab_id}")
+            group.forget(f"ready-{group.tab_id}")
+            _live_closing = True
+            bpy.ops.wm.quit_blender("EXEC_DEFAULT")
+            return None
+        except (OSError, RuntimeError) as exc:
+            _live_closing = False
+            group.forget(f"close-{group.tab_id}")
+            _add_live_tab(tab)
+            group.reveal_all()
+            print(f"Multi Files Bookmark: project was not closed: {exc}")
+    handoff = group.read(f"overlay-handoff-{group.tab_id}").get("state")
+    if handoff in OVERLAY_STATES:
+        group.forget(f"overlay-handoff-{group.tab_id}")
+        area = _primary_view3d_area(bpy.context)
+        if area:
+            _set_overlay_area_state(_area_id(area), handoff, bpy.context)
+    foreground = processes.foreground_pid()
+    active_id = group.read("active").get("tab_id", "")
+    active_pid, active_windows = group.ready(active_id)
+    if active_id != group.tab_id and active_windows and foreground == active_pid:
+        processes.hide(processes.windows(os.getpid()))
+    elif not active_windows or not processes.any_visible(active_windows):
+        processes.reveal(processes.windows(os.getpid()))
+    if foreground == os.getpid():
+        mouse = processes.cursor_in_current_window()
+        wm = _window_manager_from_context()
+        tabs = _clean_registry(_read_registry())["tabs"]
+        if wm and list((item.tab_id, item.filepath, item.cache_filepath, item.thumbnail_filepath) for item in wm.mbb_bookmarks) != [
+                (tab["tab_id"], tab["filepath"], tab["cache_filepath"], tab["thumbnail_filepath"]) for tab in tabs]:
+            _sync_registry_to_properties(bpy.context)
+            _tag_view3d_redraw()
+        if mouse != _overlay_mouse_abs:
+            _overlay_mouse_abs = mouse
+            _tag_view3d_redraw()
+    return 0.12
+
+
+def _remove_live_recent_paths(paths, previous):
+    if previous is None:
+        return
+    excluded = {_normalized_path(path) for path in paths if path} - {_normalized_path(path) for path in previous}
+    now = _read_blender_recent_files()
+    if now is not None and excluded:
+        _write_blender_recent_files([path for path in now if _normalized_path(path) not in excluded])
+
+
+def _bind_native_open_in_live_group():
+    global _pending_overlay_state
+    group = _live_group
+    if not group or _live_booting or _live_binding:
+        return None
+    current = _current_blend_filepath()
+    tab = _find_tab_by_any_path(current)
+    if tab and tab["tab_id"] == group.tab_id and _normalized_path(current) == _normalized_path(tab["cache_filepath"]):
+        return None
+    if tab and group.ready(tab["tab_id"])[1] and tab["tab_id"] != group.tab_id:
+        _pid, hwnds = group.ready(tab["tab_id"])
+        if processes.foreground_pid() == os.getpid():
+            processes.focus(hwnds)
+        if _live_switch_ready(tab["tab_id"], _state_for_overlay_handoff(context=bpy.context)):
+            # Do not bind this copy to a cache another instance owns.
+            group.forget(f"ready-{group.tab_id}")
+            bpy.ops.wm.quit_blender("EXEC_DEFAULT")
+            return None
+        # This native load already replaced the local scene; leave it as an
+        # independent copy instead of binding it to another process's cache.
+        tab = _live_tab_for_path(_next_untitled_cache_path(), untitled=True)
+    tab = tab or _live_tab_for_path(current or _next_untitled_cache_path(), untitled=not current)
+    try:
+        previous_id = group.tab_id
+        _bind_live_cache(tab)
+        group.forget(f"ready-{previous_id}")
+        group.rebind(tab["tab_id"])
+        group.publish()
+        group.write("active", {"tab_id": group.tab_id})
+        _pending_overlay_state = ""
+        _sync_registry_to_properties(bpy.context)
+        _tag_view3d_redraw()
+    except (OSError, RuntimeError) as exc:
+        group.reveal_all()
+        print(f"Multi Files Bookmark: could not bind native open to a working cache: {exc}")
+    return None
+
+
 def _blend_paths_from_operator(operator):
     paths = []
     directory = bpy.path.abspath(getattr(operator, "directory", "") or "")
@@ -3507,7 +4031,9 @@ def _open_blend_bookmark_paths(context, filepaths, load_ui=True, use_scripts=Fal
         return {"CANCELLED"}
 
     active_path = valid_paths[-1]
-    _add_paths_to_blender_recent_files(valid_paths)
+    if _live_group:
+        return _open_live_paths(context, valid_paths, load_ui, use_scripts)
+    _add_paths_to_blender_recent_files(valid_paths, include_cache=True)
     _remember_overlay_state(context=context)
     _save_current_project_to_cache(capture_thumbnail=True)
     for path in valid_paths:
@@ -3668,6 +4194,8 @@ class MBB_OT_new_blend_bookmark(bpy.types.Operator):
 
     def execute(self, context):
         _remember_overlay_state(context=context)
+        if _live_group:
+            return _execute_or_defer(lambda: _new_live_tab(bpy.context))
         return _execute_or_defer(lambda: (_create_untitled_bookmark(bpy.context, save_current=True), {"FINISHED"})[1])
 
 
@@ -3717,11 +4245,21 @@ class MBB_OT_save_original_project(bpy.types.Operator):
 
         current = _current_blend_filepath()
         tab = _current_registry_tab(current)
+        if _live_group:
+            tab = _live_tab(_live_group.tab_id)
+            if not tab or _normalized_path(tab["cache_filepath"]) != _normalized_path(current):
+                self.report({"WARNING"}, _t("The project is not ready to save to its original location"))
+                return {"CANCELLED"}
         old_original = bpy.path.abspath(tab.get("filepath", "")) if tab else ""
         cache_path = bpy.path.abspath(tab.get("cache_filepath", "")) if tab and tab.get("cache_filepath", "") else bpy.path.abspath(current)
+        if _live_group:
+            other = _find_tab_by_any_path(filepath)
+            if _is_cache_file_path(filepath) or (other and other["tab_id"] != tab["tab_id"]):
+                self.report({"WARNING"}, _t("Choose an original file outside the cache that is not open in another tab"))
+                return {"CANCELLED"}
 
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        _save_as_mainfile_resilient(
+        result = _save_as_mainfile_resilient(
             "EXEC_DEFAULT",
             filepath=filepath,
             copy=True,
@@ -3729,6 +4267,8 @@ class MBB_OT_save_original_project(bpy.types.Operator):
             compress=bool(self.compress),
             relative_remap=bool(self.relative_remap),
         )
+        if "FINISHED" not in result:
+            return {"CANCELLED"}
 
         if old_original and old_original != filepath and (_is_cache_file_path(old_original) or _is_untitled_path(old_original)):
             _remove_registry_tab(old_original)
@@ -3736,6 +4276,7 @@ class MBB_OT_save_original_project(bpy.types.Operator):
             filepath,
             _title_from_path(filepath),
             cache_filepath=cache_path if cache_path else None,
+            tab_id=tab.get("tab_id") if tab else None,
             thumbnail_placeholder=False,
             ui_state_hash=_current_ui_state_hash(context),
             is_active=True,
@@ -4032,8 +4573,13 @@ class MBB_OT_user_pref_menu(bpy.types.Operator):
         if not prefs:
             return
         layout = self.layout
+        live_row = layout.row()
+        live_row.enabled = processes.SUPPORTED
+        live_row.prop(prefs, "use_live_projects", text=_t(LIVE_MODE_LABEL))
         self.draw_compact_prop(layout, prefs, "shortcut_scope", _t("Keymap Scope"))
-        self.draw_compact_prop(layout, prefs, "cache_directory", _t("Cache Folder"))
+        cache_row = layout.column(align=True)
+        cache_row.enabled = _live_group is None
+        self.draw_compact_prop(cache_row, prefs, "cache_directory", _t("Cache Folder"))
         layout.prop(prefs, "show_hover_full_name", text=_t("Show Full Name on Hover"))
         layout.prop(prefs, "show_hover_file_path", text=_t("Show File Path on Hover"))
         row = layout.row(align=True)
@@ -4053,7 +4599,7 @@ class MBB_OT_user_pref_menu(bpy.types.Operator):
         return {"FINISHED"}
 
     def invoke(self, context, _event):
-        return context.window_manager.invoke_popup(self, width=300)
+        return context.window_manager.invoke_popup(self, width=370)
 
 
 class MBB_OT_reset_ui_colors(bpy.types.Operator):
@@ -4102,6 +4648,8 @@ class MBB_OT_open_bookmark(bpy.types.Operator):
         if bookmark is None:
             self.report({"ERROR"}, "Bookmark index is invalid.")
             return {"CANCELLED"}
+        if _live_group:
+            return self.execute(context)
 
         current = bpy.path.abspath(_current_blend_filepath()) if _current_blend_filepath() else ""
         target = _bookmark_target_path(bookmark)
@@ -4117,6 +4665,9 @@ class MBB_OT_open_bookmark(bpy.types.Operator):
         if not bookmark.filepath:
             self.report({"ERROR"}, "This bookmark has no file path.")
             return {"CANCELLED"}
+        if _live_group:
+            tab_id = bookmark.tab_id
+            return _execute_or_defer(lambda: _switch_live_tab(tab_id))
 
         target = _bookmark_target_path(bookmark)
         if not os.path.exists(target):
@@ -4158,6 +4709,9 @@ class MBB_OT_remove_bookmark(bpy.types.Operator):
         if index >= len(tabs):
             self.report({"ERROR"}, "Bookmark index is invalid.")
             return {"CANCELLED"}
+        if _live_group:
+            tab_id = tabs[index]["tab_id"]
+            return _execute_or_defer(lambda: _close_live_tabs({tab_id}))
 
         closing_tab = tabs[index]
         _store_last_closed_tabs([closing_tab])
@@ -5183,6 +5737,9 @@ def _close_selected_bookmarks(context):
         return {"CANCELLED"}
 
     closing_tabs = [tabs[index] for index in selected_indices]
+    if _live_group:
+        ids = {tab["tab_id"] for tab in closing_tabs}
+        return _execute_or_defer(lambda: _close_live_tabs(ids))
     _store_last_closed_tabs(closing_tabs)
     active_index = _active_bookmark_index(context)
     fallback_tab = _next_remaining_tab_after_close(tabs, selected_indices, active_index)
@@ -5217,6 +5774,10 @@ def _area_id(area):
 
 def _primary_view3d_area(context):
     screen = getattr(context, "screen", None)
+    if not screen and _live_group:
+        wm = _window_manager_from_context(context)
+        window = next(iter(wm.windows), None) if wm else None
+        screen = window.screen if window else None
     if not screen:
         return getattr(context, "area", None)
     areas = [area for area in screen.areas if area.type == "VIEW_3D"]
@@ -5392,6 +5953,9 @@ def _wake_overlay_router_for_cancel(context=None):
     context = context or bpy.context
     window = getattr(context, "window", None)
     if window is None:
+        wm = _window_manager_from_context(context)
+        window = next(iter(wm.windows), None) if wm else None
+    if window is None:
         return
     try:
         window.event_simulate(type="MOUSEMOVE", value="NOTHING", x=0, y=0)
@@ -5466,16 +6030,25 @@ class MBB_OT_overlay_router(bpy.types.Operator):
                 "POST_PIXEL",
             )
         _overlay_router_running = True
+        self._wake_timer = context.window_manager.event_timer_add(0.5, window=context.window)
         context.window_manager.modal_handler_add(self)
         return {"RUNNING_MODAL"}
+
+    def cancel(self, context):
+        timer = getattr(self, "_wake_timer", None)
+        if timer is not None:
+            context.window_manager.event_timer_remove(timer)
+            self._wake_timer = None
 
     def modal(self, context, event):
         global _overlay_mouse_abs, _overlay_absorb_leftmouse_release
         if not _overlay_router_running:
+            self.cancel(context)
             return {"CANCELLED"}
 
         if event.type == "F8" and event.value == "PRESS":
             bpy.ops.wm.mbb_reload_scripts()
+            self.cancel(context)
             return {"CANCELLED"}
 
         if event.type in {"MOUSEMOVE", "LEFTMOUSE"}:
@@ -5544,10 +6117,60 @@ class MBB_OT_overlay_router(bpy.types.Operator):
         return {"PASS_THROUGH"}
 
 
+class MBB_OT_live_dock_click(bpy.types.Operator):
+    bl_idname = "view3d.mbb_live_dock_click"
+    bl_label = "Bookmark Dock Click"
+    bl_options = {"INTERNAL"}
+
+    @classmethod
+    def poll(cls, _context):
+        return _live_group is not None and not _live_booting
+
+    def invoke(self, context, event):
+        global _overlay_mouse_abs
+        _overlay_mouse_abs = (event.mouse_x, event.mouse_y)
+        area_id = _area_id(context.area)
+        item = _hitbox_at(event.mouse_x, event.mouse_y, _overlay_hitboxes_by_area.get(area_id, []))
+        if not item:
+            return {"PASS_THROUGH"}
+        action = item["action"]
+        index = item.get("index", -1)
+        if action == "new":
+            _defer_ui_action(lambda: bpy.ops.wm.mbb_new_blend())
+        elif action == "open":
+            _defer_ui_action(lambda: bpy.ops.wm.mbb_open_blend("INVOKE_DEFAULT"))
+        elif action in {"view_names", "view_thumbnails"}:
+            _set_overlay_area_state(area_id, "NAMES" if action == "view_names" else "THUMBNAILS", context)
+        elif action == "switch":
+            if event.shift:
+                _select_bookmark_range(context, index)
+            else:
+                _set_single_selection(index)
+                _defer_ui_action(lambda: bpy.ops.wm.mbb_open_bookmark(index=str(index)))
+        elif action == "close":
+            _defer_ui_action(lambda: bpy.ops.wm.mbb_remove_bookmark(index=str(index)))
+        _tag_view3d_redraw(context)
+        return {"FINISHED"}
+
+
 @persistent
 def _mbb_load_pre(_dummy):
-    global _foreground_autosave_last_tick
-    _foreground_autosave_last_tick = time.monotonic()
+    global _foreground_autosave_active_key
+    if _live_group:
+        if not _live_booting:
+            _persist_overlay_state(bpy.context)
+            _remember_overlay_state(context=bpy.context)
+            tab = _live_tab(_live_group.tab_id)
+            if tab and _normalized_path(tab["cache_filepath"]) == _normalized_path(_current_blend_filepath()):
+                try:
+                    recent = _read_blender_recent_files()
+                    _save_live_cache(tab["cache_filepath"], copy=True)
+                    _remove_live_recent_paths([tab["cache_filepath"]], recent)
+                except (OSError, RuntimeError) as exc:
+                    print(f"Multi Files Bookmark: could not snapshot before native file load: {exc}")
+        return
+    _account_foreground_autosave_time()
+    _foreground_autosave_active_key = ""
     _persist_overlay_state(bpy.context)
     _remember_overlay_state(context=bpy.context)
     _register_current_process_tab(is_active=False)
@@ -5566,19 +6189,85 @@ def _mbb_load_post(_dummy):
     wm = _window_manager_from_context()
     if wm is not None and hasattr(wm, "mbb_view_mode"):
         wm.mbb_view_mode = _overlay_view_mode_state
+    if _live_group:
+        _sync_registry_to_properties(bpy.context)
+        if not _live_booting:
+            bpy.app.timers.register(_bind_native_open_in_live_group, first_interval=0.05)
+        _schedule_overlay_router_restart()
+        return
     if time.monotonic() < _startup_session_deadline:
         _ensure_startup_session()
     else:
         _register_current_process_tab(is_active=True)
         _sync_registry_to_properties(bpy.context)
+    _start_foreground_autosave_timer()
     _schedule_overlay_router_restart()
 
 
 @persistent
-def _mbb_save_post(_dummy):
+def _mbb_save_pre(_dummy):
+    global _saving_registry_tab, _saving_recent_files
+    if _live_binding or _live_booting:
+        return
+    tab = _current_registry_tab()
+    _saving_registry_tab = dict(tab) if tab else None
+    _saving_recent_files = _read_blender_recent_files()
+
+
+@persistent
+def _mbb_save_post(saved_filepath):
+    global _saving_registry_tab, _saving_recent_files
+    if _live_binding or _live_booting:
+        return
+    source_tab = _saving_registry_tab
+    recent_files_before_save = _saving_recent_files
+    _saving_registry_tab = None
+    _saving_recent_files = None
+    current = _current_blend_filepath()
+    # Blender updates native history before save_post, using the live path
+    # even for copy=True. Undo only this save's history changes: an existing
+    # cache entry created by explicitly opening the file must be preserved.
+    if recent_files_before_save is not None and (
+            _is_cache_file_path(saved_filepath) or _is_cache_file_path(current)):
+        if _live_group:
+            existing = set(recent_files_before_save)
+            current_recent = _read_blender_recent_files() or []
+            _write_blender_recent_files([p for p in current_recent if p in existing or not _is_cache_file_path(p)])
+        else:
+            _write_blender_recent_files(recent_files_before_save)
+    if _live_group:
+        tab = _live_tab(_live_group.tab_id)
+        if tab and _normalized_path(current) != _normalized_path(tab["cache_filepath"]):
+            # Explicit native Save As may export a copy, but the working
+            # session returns to its own cache without reopening it.
+            def restore_working_path():
+                if _live_group and _normalized_path(current) == _normalized_path(_current_blend_filepath()):
+                    _bind_live_cache(tab, tab["cache_filepath"])
+                return None
+            bpy.app.timers.register(restore_working_path, first_interval=0.01)
+        _persist_overlay_state(bpy.context)
+        if isinstance(saved_filepath, str):
+            _add_paths_to_blender_recent_files([saved_filepath])
+        return
+    # Native Save As changes the live path. Keep the project ID and its timer
+    # when the cached untitled project acquires a user-selected filename.
+    if (source_tab and not _is_cache_file_path(current)
+            and _normalized_path(source_tab["filepath"]) != _normalized_path(current)
+            and _normalized_path(saved_filepath) == _normalized_path(current)):
+        _remove_registry_tab(source_tab["filepath"])
+        _upsert_registry_tab(
+            current, _title_from_path(current),
+            cache_filepath="",
+            tab_id=source_tab.get("tab_id"),
+            thumbnail_placeholder=False,
+            ui_state_hash=_current_ui_state_hash(bpy.context),
+            is_active=True,
+        )
     _persist_overlay_state(bpy.context)
-    _register_current_process_tab(is_active=False)
+    _register_current_process_tab(is_active=True)
     _sync_registry_to_properties(bpy.context)
+    if isinstance(saved_filepath, str):
+        _add_paths_to_blender_recent_files([saved_filepath])
 
 
 def _draw_header_tab_toggle(layout, context):
@@ -5693,6 +6382,7 @@ classes = (
     MBB_OT_dock_shortcut,
     MBB_OT_reload_scripts,
     MBB_OT_overlay_router,
+    MBB_OT_live_dock_click,
 )
 
 
@@ -5716,6 +6406,9 @@ def _register_keymaps():
     kc = wm.keyconfigs.addon if wm else None
     if not kc:
         return
+    dock = kc.keymaps.new(name="3D View", space_type="VIEW_3D")
+    click = dock.keymap_items.new(MBB_OT_live_dock_click.bl_idname, "LEFTMOUSE", "PRESS", any=True, head=True)
+    addon_keymaps.append((dock, click))
     km = kc.keymaps.new(name=KEYMAP_NAME, space_type=KEYMAP_SPACE_TYPE)
     reload_item = km.keymap_items.new(
         MBB_OT_reload_scripts.bl_idname,
@@ -5774,7 +6467,13 @@ def _unregister_keymaps():
 
 
 def _start_overlay_router():
+    global _overlay_draw_handler
     if bpy.app.background:
+        return None
+    if _live_group:
+        if _overlay_draw_handler is None:
+            _overlay_draw_handler = bpy.types.SpaceView3D.draw_handler_add(_draw_view3d_tab_bar, (), "WINDOW", "POST_PIXEL")
+        _tag_view3d_redraw()
         return None
     if _overlay_router_running:
         return None
@@ -5834,13 +6533,16 @@ def _remove_system_menu_reload():
 
 
 def register():
-    global _startup_session_initialized, _startup_session_deadline
+    global _startup_session_initialized, _startup_session_deadline, _live_group, _live_booting
+    _live_group = processes.Group.from_environment() if not bpy.app.background else None
+    _live_booting = bool(_live_group and _live_group.read(f"job-{_live_group.tab_id}"))
     _register_translations()
 
     for cls in classes:
         bpy.utils.register_class(cls)
     _register_theme_color_source_menus()
-    _migrate_cache_layout()
+    if not _live_group:
+        _migrate_cache_layout()
 
     bpy.types.WindowManager.mbb_bookmarks = CollectionProperty(type=MBB_BookmarkItem)
     bpy.types.WindowManager.mbb_view_mode = EnumProperty(
@@ -5855,7 +6557,11 @@ def register():
 
     existing_data = _clean_registry(_read_registry())
     resuming_process = _process_session_is_registered(bpy.context) and bool(existing_data["tabs"])
-    if resuming_process:
+    if _live_group:
+        _startup_session_initialized = True
+        _startup_session_deadline = 0.0
+        _sync_registry_to_properties(bpy.context)
+    elif resuming_process:
         _startup_session_initialized = True
         _startup_session_deadline = 0.0
         current_tab = _find_tab_by_any_path(_current_blend_filepath())
@@ -5881,15 +6587,22 @@ def register():
         bpy.app.handlers.load_post.append(_mbb_load_post)
     if _mbb_save_post not in bpy.app.handlers.save_post:
         bpy.app.handlers.save_post.append(_mbb_save_post)
-    if bpy.app.background or resuming_process:
+    if _mbb_save_pre not in bpy.app.handlers.save_pre:
+        bpy.app.handlers.save_pre.append(_mbb_save_pre)
+    if _live_group:
+        if not _live_booting:
+            bpy.app.timers.register(_resume_live_runtime, first_interval=0.1)
+    elif bpy.app.background or resuming_process:
         _ensure_startup_session()
     else:
         try:
             bpy.app.timers.register(_ensure_startup_session, first_interval=0.25)
         except ValueError:
             pass
+    if not bpy.app.background and not _live_group:
         bpy.app.timers.register(_start_overlay_router, first_interval=0.2)
         _start_foreground_autosave_timer()
+        _update_live_preference()
 
 
 def unregister():
@@ -5908,6 +6621,12 @@ def unregister():
     _remove_system_menu_reload()
     _remove_drop_blend_patch()
     _stop_foreground_autosave_timer()
+    if _live_group:
+        _live_group.reveal_all()
+        _live_group.forget(f"ready-{_live_group.tab_id}")
+    for callback in (_live_tick, _enable_live_group, _bind_native_open_in_live_group, _resume_live_runtime, _start_overlay_router):
+        if bpy.app.timers.is_registered(callback):
+            bpy.app.timers.unregister(callback)
     if bpy.app.timers.is_registered(_ensure_startup_session):
         try:
             bpy.app.timers.unregister(_ensure_startup_session)
@@ -5920,6 +6639,8 @@ def unregister():
         bpy.app.handlers.load_post.remove(_mbb_load_post)
     if _mbb_save_post in bpy.app.handlers.save_post:
         bpy.app.handlers.save_post.remove(_mbb_save_post)
+    if _mbb_save_pre in bpy.app.handlers.save_pre:
+        bpy.app.handlers.save_pre.remove(_mbb_save_pre)
 
     _unregister_keymaps()
 
