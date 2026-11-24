@@ -50,6 +50,8 @@ ZH_CN = {
     ("*", "Title"): "标题",
     ("*", "Cache Folder"): "缓存目录",
     ("*", "Folder for cached .blend files and bookmark thumbnails"): "用于缓存 .blend 文件和书签缩略图的文件夹",
+    ("*", "New caches and previews use this folder."): "新建缓存和缩略图使用此目录。",
+    ("*", "Open projects keep their working files."): "已打开的项目保留原工作文件。",
     ("*", "Change UI Color"): "修改界面颜色",
     ("*", "Edit dock UI colors"): "修改面板界面颜色",
     ("*", "User Pref"): "用户偏好",

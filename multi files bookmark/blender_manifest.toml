@@ -10,3 +10,6 @@ type = "add-on"
 website = "https://github.com/VODIAC/BlenderAddon_Multi_Files_Bookmark"
 copyright = ["2026 61+"]
 tags = ["Pipeline"]
+
+[permissions]
+files = "Open and save projects, and store working copies and previews"

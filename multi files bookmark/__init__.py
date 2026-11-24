@@ -47,6 +47,7 @@ PROCESS_SESSION_MARKER = "_multi_blender_bookmark_session_id"
 LEGACY_REGISTRY_PATH = os.path.join(tempfile.gettempdir(), "multi_blender_bookmark.json")
 UI_COLOR_PRESETS_FILENAME = "multi_blender_bookmark_ui_color_presets.json"
 UI_COLOR_PRESETS_LOCATION_FILENAME = "multi_blender_bookmark_ui_color_presets_location.json"
+LIVE_CACHE_SETTINGS_FILENAME = "cache_directory.json"
 
 MAX_BOOKMARK_LABEL_CHARS = 12
 OVERLAY_MARGIN = 14
@@ -153,6 +154,8 @@ _saving_registry_tab = None
 _saving_recent_files = None
 _reload_scripts_pending = False
 _live_group = None
+_saved_cache_settings = {}
+_syncing_cache_preference = False
 _live_transition = None
 _live_booting = False
 _live_binding = False
@@ -407,7 +410,7 @@ def _mark_process_session_registered(context=None):
 
 def _cache_dir():
     if _live_group:
-        return _live_group.config["cache"]
+        return _live_group.cache_settings["directory"]
     prefs = _addon_preferences()
     if prefs and hasattr(prefs, "cache_directory") and prefs.cache_directory:
         path = bpy.path.abspath(prefs.cache_directory)
@@ -425,6 +428,21 @@ def _cache_dir():
         path = os.path.join(bpy.app.tempdir or tempfile.gettempdir(), CACHE_FOLDER_NAME)
         os.makedirs(path, exist_ok=True)
     return path
+
+
+def _previous_cache_directories():
+    settings = _live_group.cache_settings if _live_group else _saved_cache_settings
+    return settings.get("previous", ())
+
+
+def _live_cache_settings_path(create=False):
+    try:
+        directory = bpy.utils.extension_path_user(ADDON_MODULE, create=create)
+    except ValueError:
+        directory = bpy.utils.user_resource("CONFIG", path=ADDON_ID, create=create)
+    if not directory:
+        raise OSError("No writable directory for bookmark cache preferences")
+    return os.path.join(directory, LIVE_CACHE_SETTINGS_FILENAME)
 
 
 def _cache_subdir(name, cache_directory=None):
@@ -1359,15 +1377,76 @@ def _update_active_ui_color_preset(self, context=None):
 
 
 def _update_cache_directory(self, _context=None):
-    if _live_group:
+    global _saved_cache_settings
+    if _syncing_cache_preference:
         return
     old_dir = bpy.path.abspath(getattr(self, "ui_color_presets_cache_directory", "") or DEFAULT_CACHE_DIR)
     new_dir = bpy.path.abspath(getattr(self, "cache_directory", "") or DEFAULT_CACHE_DIR)
+    if _live_group:
+        group = _live_group
+        settings = group.refresh_cache_settings()
+        old_dir = settings["directory"]
+        new_dir = os.path.abspath(new_dir)
+        if _normalized_path(old_dir) == _normalized_path(new_dir):
+            return
+        previous = {_normalized_path(path): path for path in (*settings.get("previous", ()), old_dir)}
+        previous.pop(_normalized_path(new_dir), None)
+        updated = {"directory": new_dir, "previous": list(previous.values())}
+        try:
+            os.makedirs(new_dir, exist_ok=True)
+            target = _ui_color_presets_path(new_dir)
+            if not os.path.exists(target):
+                source = _ui_color_presets_path(old_dir)
+                if os.path.isfile(source):
+                    with open(source, encoding="utf-8", newline="") as handle:
+                        processes.write_text(target, handle.read())
+            # Keep the old registry and working paths usable by resident Blender processes.
+            location = _live_cache_settings_path(create=True)
+            group.write("cache-settings", updated)
+            try:
+                processes.write(location, updated)
+            except OSError:
+                group.write("cache-settings", settings)
+                raise
+        except OSError as exc:
+            _set_cache_preference(self, old_dir)
+            print(f"Multi Files Bookmark: could not change the cache folder: {exc}")
+            return
+        _saved_cache_settings = updated
+        _sync_live_cache_preference(self)
+        _save_ui_color_presets_location(new_dir)
+        _tag_view3d_redraw()
+        return
     _migrate_cache_directory_contents(old_dir, new_dir)
     if not os.path.exists(_ui_color_presets_path(new_dir)):
         _save_ui_color_presets_to_disk(self)
     self.ui_color_presets_cache_directory = new_dir
     _save_ui_color_presets_location(new_dir)
+    if _saved_cache_settings.get("directory"):
+        updated = dict(_saved_cache_settings, directory=os.path.abspath(new_dir))
+        try:
+            processes.write(_live_cache_settings_path(create=True), updated)
+            _saved_cache_settings = updated
+        except OSError as exc:
+            print(f"Multi Files Bookmark: could not remember the cache folder: {exc}")
+
+
+def _set_cache_preference(prefs, directory):
+    global _syncing_cache_preference
+    if prefs is not None and (prefs.cache_directory != directory or prefs.ui_color_presets_cache_directory != directory):
+        # Mirroring a shared preference must not start another migration.
+        _syncing_cache_preference = True
+        try:
+            if prefs.cache_directory != directory:
+                prefs.cache_directory = directory
+            prefs.ui_color_presets_cache_directory = directory
+        finally:
+            _syncing_cache_preference = False
+
+
+def _sync_live_cache_preference(prefs=None):
+    directory = _live_group.refresh_cache_settings()["directory"]
+    _set_cache_preference(prefs or _addon_preferences(), directory)
 
 
 def _request_view3d_redraw(context=None):
@@ -1865,7 +1944,8 @@ def _write_tabs_file(path, data):
 
 def _registry_history_paths():
     paths = []
-    for directory in (_state_dir(), DEFAULT_STATE_DIR, DEFAULT_CACHE_DIR):
+    previous_states = (os.path.join(path, STATE_FOLDER_NAME) for path in _previous_cache_directories())
+    for directory in (_state_dir(), *previous_states, DEFAULT_STATE_DIR, DEFAULT_CACHE_DIR):
         try:
             for name in os.listdir(directory):
                 if name.startswith("multi_blender_bookmark") and name.endswith(".json") and "overlay_state" not in name and "last_closed" not in name and "ui_color" not in name:
@@ -2235,14 +2315,9 @@ def _find_tab_by_any_path(filepath):
 
 
 def _is_cache_file_path(filepath):
-    filepath = _normalized_path(filepath)
-    if not filepath:
-        return False
-    try:
-        cache_directory = _normalized_path(_cache_dir())
-        return os.path.commonpath([filepath, cache_directory]) == cache_directory
-    except (OSError, ValueError):
-        return False
+    return bool(filepath) and any(_path_is_within(filepath, directory) for directory in (
+        _cache_dir(), *_previous_cache_directories(),
+    ))
 
 
 def _manual_save_target_from_tab(tab, current=""):
@@ -2290,20 +2365,20 @@ def _current_registry_tab(current=""):
 
 def _next_untitled_cache_path():
     data = _clean_registry(_read_registry())
-    used = set()
-    for tab in data["tabs"]:
-        for path in (tab.get("filepath", ""), tab.get("cache_filepath", "")):
-            if path:
-                used.add(bpy.path.abspath(path))
+    def key(path):
+        path = _normalized_path(path)
+        return os.path.basename(path) if _live_group else path
+
+    used = {key(tab[field]) for tab in data["tabs"] for field in ("filepath", "cache_filepath") if tab[field]}
 
     first_path = os.path.join(_cache_dir(), "Untitled.blend")
-    if bpy.path.abspath(first_path) not in used:
+    if key(first_path) not in used:
         return first_path
 
     for index in range(1, 1000):
         name = f"Untitled_{index:02d}.blend"
         path = os.path.join(_cache_dir(), name)
-        if bpy.path.abspath(path) not in used:
+        if key(path) not in used:
             return path
     return os.path.join(_cache_dir(), f"Untitled_{int(_now())}.blend")
 
@@ -3632,6 +3707,10 @@ def _enable_live_group():
         if not _is_resident_cache(tab.get("cache_filepath")) or _normalized_path(tab["cache_filepath"]) != _normalized_path(_current_blend_filepath()):
             _bind_live_cache(tab)
         _live_group = processes.Group.create(tab["tab_id"], _registry_path(), _cache_dir())
+        if _saved_cache_settings.get("previous"):
+            _live_group.write("cache-settings", {
+                "directory": _cache_dir(), "previous": list(_saved_cache_settings.get("previous", ())),
+            })
         _live_group.publish()
         _live_group.write("active", {"tab_id": tab["tab_id"]})
         if _closed_tab_history:
@@ -3841,6 +3920,7 @@ def _start_live_worker():
             for name, value in job.get("preferences", {}).items():
                 if name != "cache_directory":
                     setattr(prefs, name, value)
+            _sync_live_cache_preference(prefs)
             _unregister_keymaps()
             _register_keymaps()
             _update_drop_panel_preference(prefs)
@@ -3876,6 +3956,7 @@ def _live_tick():
         return None
     if _live_booting:
         return 0.1
+    _sync_live_cache_preference()
     group.children = {key: child for key, child in group.children.items() if child.poll() is None}
     if not group.ready(group.tab_id)[1] and not group.publish():
         return 0.1
@@ -4578,8 +4659,10 @@ class MBB_OT_user_pref_menu(bpy.types.Operator):
         live_row.prop(prefs, "use_live_projects", text=_t(LIVE_MODE_LABEL))
         self.draw_compact_prop(layout, prefs, "shortcut_scope", _t("Keymap Scope"))
         cache_row = layout.column(align=True)
-        cache_row.enabled = _live_group is None
         self.draw_compact_prop(cache_row, prefs, "cache_directory", _t("Cache Folder"))
+        if _live_group:
+            cache_row.label(text=_t("New caches and previews use this folder."))
+            cache_row.label(text=_t("Open projects keep their working files."))
         layout.prop(prefs, "show_hover_full_name", text=_t("Show Full Name on Hover"))
         layout.prop(prefs, "show_hover_file_path", text=_t("Show File Path on Hover"))
         row = layout.row(align=True)
@@ -6534,12 +6617,22 @@ def _remove_system_menu_reload():
 
 def register():
     global _startup_session_initialized, _startup_session_deadline, _live_group, _live_booting
+    global _saved_cache_settings
     _live_group = processes.Group.from_environment() if not bpy.app.background else None
     _live_booting = bool(_live_group and _live_group.read(f"job-{_live_group.tab_id}"))
     _register_translations()
 
     for cls in classes:
         bpy.utils.register_class(cls)
+    try:
+        _saved_cache_settings = processes.read(_live_cache_settings_path())
+    except OSError:
+        _saved_cache_settings = {}
+    prefs = _addon_preferences()
+    if _live_group:
+        _sync_live_cache_preference(prefs)
+    elif prefs and _saved_cache_settings.get("directory"):
+        _set_cache_preference(prefs, _saved_cache_settings["directory"])
     _register_theme_color_source_menus()
     if not _live_group:
         _migrate_cache_layout()

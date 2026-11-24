@@ -89,6 +89,7 @@ def run():
             assert bpy.context.scene["mbb_live_test"] == 3
             state["source"] = group.tab_id
             state["working"] = bpy.data.filepath
+            state["registry"] = addon._registry_path()
             paths = [str(root / folder / "Same.blend") for folder in ("a", "b")]
             assert addon._open_live_paths(bpy.context, paths, True, False) == {"FINISHED"}
             state["paths"] = paths
@@ -106,13 +107,22 @@ def run():
             assert Path(tab["cache_filepath"]).is_file()
             assert addon.processes.foreground_pid() == pid
             assert not addon.processes.any_visible(addon.processes.windows(os.getpid()))
-            # Run the switch from the foreground worker, just like a user click.
-            group.write(f"test-{tab['tab_id']}", {"switch": state["source"]})
+            # Change the cache folder from a worker, not the session's first process.
+            group.write(f"test-{tab['tab_id']}", {"change_cache": True, "switch": state["source"]})
             advance("Worker opened a distinct cache; only its project window is visible")
         elif step == 3:
             if addon.processes.foreground_pid() != os.getpid() or addon._live_group.read("active").get("tab_id") != state["source"]:
                 return 0.25
             assert bpy.data.filepath == state["working"]
+            new_cache = root / "moved-cache"
+            assert Path(prefs.cache_directory) == new_cache
+            assert addon._registry_path() == state["registry"]
+            assert Path(state["working"]).is_file()
+            assert Path(state["b"]["cache_filepath"]).is_file()
+            assert (root / "cache" / "unrelated.blend").read_bytes() == b"not a cache"
+            assert addon._is_resident_cache(state["working"])
+            assert Path(addon._live_cache_settings_path()).is_file()
+            assert Path(addon._thumbnail_path_for("", tab_id=state["source"])).parent == new_cache / "screenshot"
             assert bpy.context.scene["mbb_live_test"] == 3
             assert bpy.ops.ed.redo() == {"FINISHED"}
             assert bpy.context.scene["mbb_live_test"] == 7
@@ -131,6 +141,7 @@ def run():
             state["pids"].append(pid)
             state["a"] = tab
             assert tab["cache_filepath"] != state["b"]["cache_filepath"]
+            assert Path(tab["cache_filepath"]).parent == root / "moved-cache"
             assert addon.processes.foreground_pid() == pid
             group.write(f"test-{tab['tab_id']}", {"save": True, "close": True})
             advance("Both same-name projects use different working caches, including Load UI off")
@@ -175,6 +186,18 @@ def worker_step():
         if not command:
             return 0.25
         group.forget(message)
+        if command.get("change_cache"):
+            working_path = bpy.data.filepath
+            registry_path = addon._registry_path()
+            (root / "cache" / "unrelated.blend").write_bytes(b"not a cache")
+            addon._ensure_ui_color_presets(prefs)
+            old_preset = Path(addon._ui_color_presets_path())
+            assert old_preset.is_file()
+            prefs.cache_directory = str(root / "moved-cache")
+            assert Path(addon._cache_dir()) == root / "moved-cache"
+            assert Path(addon._ui_color_presets_path()).read_bytes() == old_preset.read_bytes()
+            assert bpy.data.filepath == working_path
+            assert addon._registry_path() == registry_path
         if command.get("switch"):
             assert addon._switch_live_tab(command["switch"]) == {"FINISHED"}
         if command.get("save"):
