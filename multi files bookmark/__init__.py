@@ -9,6 +9,7 @@ import math
 import os
 import re
 import hashlib
+import importlib
 import shutil
 import tempfile
 import time
@@ -23,8 +24,15 @@ from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, FloatVectorProperty, IntProperty, StringProperty
 from gpu_extras.batch import batch_for_shader
 
-from .translation import TRANSLATIONS, theme_path_labels
+from . import translation as _translation
 from . import project_processes as processes
+
+
+# Blender reloads the add-on entry point without reloading its submodules.
+if "TRANSLATIONS" in globals():
+    importlib.reload(_translation)
+TRANSLATIONS = _translation.TRANSLATIONS
+theme_path_labels = _translation.theme_path_labels
 
 
 ADDON_ID = "multi_blender_bookmark"
