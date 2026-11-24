@@ -59,6 +59,8 @@ ZH_CN = {
     ("*", "Keep each project's undo and redo history in its own Blender process. When disabled, switching reloads the cached file and uses fewer processes, but undo history is unavailable after switching projects. Turning this off takes effect the next time you start Blender"): "为每个项目保留独立 Blender 进程，以留存撤销和重做记录。未勾选时，切换项目会重新打开缓存文件，占用的进程更少，但切换后无法使用之前的撤销历史。取消勾选后，下次启动 Blender 时生效。",
     ("*", "Edit bookmark user preferences"): "修改书签用户偏好",
     ("*", "Keymap Scope"): "快捷键生效范围",
+    ("*", "Prioritize Add-on Shortcuts"): "优先生效本插件的快捷键",
+    ("*", "Give this add-on's shortcuts priority in conflicting editor keymaps to reduce missed shortcuts caused by other bindings"): "勾选后提高本插件快捷键在冲突的编辑器键位表中的优先级，减少因其他指令占用按键而无法触发的情况。",
     ("*", "Choose whether bookmark shortcuts work everywhere or only while the mouse is over the dock"): "选择书签快捷键全局生效或仅在鼠标位于面板内时生效",
     ("*", "Global Range"): "全局生效",
     ("*", "Bookmark shortcuts work everywhere"): "书签快捷键全局生效",

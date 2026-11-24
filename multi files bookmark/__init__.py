@@ -116,6 +116,7 @@ _theme_color_item_nodes = {}
 _theme_color_dynamic_menu_classes = []
 
 addon_keymaps = []
+_priority_keymaps = {}
 _overlay_draw_handler = None
 _overlay_router_running = False
 _overlay_hitboxes = []
@@ -192,6 +193,11 @@ TOGGLE_BAR_SHORTCUT_OPERATOR_ID = "wm.mbb_toggle_area_tab_bar"
 SAVE_ORIGINAL_OPERATOR_ID = "wm.mbb_save_original_project"
 KEYMAP_NAME = "Window"
 KEYMAP_SPACE_TYPE = "EMPTY"
+SHORTCUT_PRIORITY_LABEL = "Prioritize Add-on Shortcuts"
+SHORTCUT_PRIORITY_DESCRIPTION = (
+    "Give this add-on's shortcuts priority in conflicting editor keymaps "
+    "to reduce missed shortcuts caused by other bindings"
+)
 INTRO_TEXT = "Dock bar sits atop the 3D View and toggles via the bookmark icon or Toggle Bar shortcut."
 
 OVERLAY_STATES = {"HIDDEN", "NAMES", "THUMBNAILS"}
@@ -2804,6 +2810,12 @@ class MBB_AddonPreferences(bpy.types.AddonPreferences):
         default=True,
         update=_update_drop_panel_preference,
     )
+    prioritize_shortcuts: BoolProperty(
+        name=SHORTCUT_PRIORITY_LABEL,
+        description=SHORTCUT_PRIORITY_DESCRIPTION,
+        default=False,
+        update=lambda self, _context: _update_shortcut_priority_preference(self),
+    )
 
     def draw(self, context):
         layout = self.layout
@@ -4072,6 +4084,11 @@ def _live_tick():
     elif not active_windows or not processes.any_visible(active_windows):
         processes.reveal(processes.windows(os.getpid()))
     if foreground == os.getpid():
+        prefs = _addon_preferences()
+        priority = group.read("shortcut-priority").get("enabled")
+        if prefs and isinstance(priority, bool) and priority != prefs.prioritize_shortcuts:
+            prefs["prioritize_shortcuts"] = priority
+            _refresh_shortcut_priority(prefs)
         mouse = processes.cursor_in_current_window()
         wm = _window_manager_from_context()
         tabs = _clean_registry(_read_registry())["tabs"]
@@ -4728,6 +4745,7 @@ class MBB_OT_user_pref_menu(bpy.types.Operator):
         col = row.column(align=True)
         col.label(text=_t("Use Plugin Panel When Dropping Files Into Blender"))
         col.label(text=_t("to Support Multiple Files"))
+        layout.prop(prefs, "prioritize_shortcuts")
 
     def draw_compact_prop(self, layout, prefs, prop_name, label):
         row = layout.row(align=True)
@@ -6559,6 +6577,104 @@ def _unregister_translations():
         pass
 
 
+def _shortcut_event_signature(item):
+    return (
+        item.type, item.value, item.direction, item.any, item.shift, item.ctrl,
+        item.alt, item.oskey, getattr(item, "hyper", 0), item.key_modifier, item.repeat,
+    )
+
+
+def _conflicts_with_shortcut(item, shortcut):
+    if item.key_modifier != shortcut.key_modifier:
+        return False
+    if item.any or shortcut.any:
+        return True
+    for modifier in ("shift", "ctrl", "alt", "oskey", "hyper"):
+        lhs, rhs = getattr(item, modifier, 0), getattr(shortcut, modifier, 0)
+        if lhs != rhs and lhs != -1 and rhs != -1:
+            return False
+    return True
+
+
+def _sync_priority_keymaps():
+    wm = getattr(bpy.context, "window_manager", None)
+    if wm is None:
+        return
+    configs = wm.keyconfigs
+    kc, user = configs.addon, configs.user
+    if kc is None or user is None:
+        return
+
+    shortcuts_by_type = {}
+    for target in SHORTCUT_TARGET_LABELS:
+        _, _, item = _keymap_item_for_target(target, user)
+        if item is not None and item.active:
+            shortcuts_by_type.setdefault(item.type, []).append((target, item))
+
+    desired = {}
+    our_operators = {DOCK_SHORTCUT_OPERATOR_ID, TOGGLE_BAR_SHORTCUT_OPERATOR_ID, SAVE_ORIGINAL_OPERATOR_ID}
+    for km in user.keymaps:
+        if km.name == KEYMAP_NAME or km.is_modal or km.space_type in {"FILE_BROWSER", "PREFERENCES"}:
+            continue
+        for item in km.keymap_items:
+            if not item.active or item.idname in our_operators:
+                continue
+            for target, shortcut in shortcuts_by_type.get(item.type, ()):
+                if _conflicts_with_shortcut(item, shortcut):
+                    key = (km.name, km.space_type, km.region_type, target, _shortcut_event_signature(shortcut))
+                    desired[key] = shortcut
+
+    removed = _priority_keymaps.keys() - desired.keys()
+    added = desired.keys() - _priority_keymaps.keys()
+    for key in removed:
+        km, item = _priority_keymaps.pop(key)
+        km.keymap_items.remove(item)
+    for key in desired:
+        if key in added:
+            name, space_type, region_type, _, _ = key
+            km = kc.keymaps.new(name=name, space_type=space_type, region_type=region_type)
+            # Blender prepends add-on items when it merges them into the user keymap.
+            _priority_keymaps[key] = (km, km.keymap_items.new_from_item(desired[key]))
+    if removed or added:
+        configs.update()
+
+
+def _clear_priority_keymaps():
+    for km, item in _priority_keymaps.values():
+        km.keymap_items.remove(item)
+    _priority_keymaps.clear()
+
+
+def _priority_keymap_timer():
+    prefs = _addon_preferences()
+    if not prefs or not prefs.prioritize_shortcuts:
+        return None
+    _sync_priority_keymaps()
+    return 0.75
+
+
+def _refresh_shortcut_priority(prefs):
+    if bpy.app.background:
+        return
+    timers = bpy.app.timers
+    if prefs.prioritize_shortcuts:
+        if not timers.is_registered(_priority_keymap_timer):
+            timers.register(_priority_keymap_timer, first_interval=0, persistent=True)
+    else:
+        if timers.is_registered(_priority_keymap_timer):
+            timers.unregister(_priority_keymap_timer)
+        _clear_priority_keymaps()
+
+
+def _update_shortcut_priority_preference(prefs):
+    _refresh_shortcut_priority(prefs)
+    if _live_group and not _live_booting:
+        try:
+            _live_group.write("shortcut-priority", {"enabled": prefs.prioritize_shortcuts})
+        except OSError as exc:
+            print(f"Multi Files Bookmark: could not sync shortcut priority: {exc}")
+
+
 def _register_keymaps():
     wm = bpy.context.window_manager
     kc = wm.keyconfigs.addon if wm else None
@@ -6613,9 +6729,13 @@ def _register_keymaps():
         )
         kmi.properties.target = target
         addon_keymaps.append((km, kmi))
+    prefs = _addon_preferences()
+    if prefs:
+        _refresh_shortcut_priority(prefs)
 
 
 def _unregister_keymaps():
+    _clear_priority_keymaps()
     for km, kmi in addon_keymaps:
         try:
             km.keymap_items.remove(kmi)
@@ -6816,6 +6936,8 @@ def unregister():
     if _mbb_exit_pre in exit_handlers:
         exit_handlers.remove(_mbb_exit_pre)
 
+    if bpy.app.timers.is_registered(_priority_keymap_timer):
+        bpy.app.timers.unregister(_priority_keymap_timer)
     _unregister_keymaps()
 
     if hasattr(bpy.types.WindowManager, "mbb_bookmarks"):
