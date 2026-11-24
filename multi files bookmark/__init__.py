@@ -2176,21 +2176,13 @@ def _ensure_startup_session():
     startup_phase = time.monotonic() < _startup_session_deadline
     current = _current_blend_filepath()
     data = _clean_registry(_read_registry())
+    if not _startup_session_initialized and startup_phase and not current:
+        # Let Blender finish loading a .blend passed on startup first.
+        return min(0.2, max(0.01, _startup_session_deadline - time.monotonic()))
     if not _startup_session_initialized:
         _initialize_new_window_session(bpy.context)
     elif current:
         _register_current_process_tab(is_active=True)
-        _sync_registry_to_properties(bpy.context)
-    elif startup_phase and data["tabs"]:
-        tab = next((item for item in reversed(data["tabs"]) if _is_untitled_tab(item)), data["tabs"][-1])
-        target = bpy.path.abspath(tab.get("cache_filepath", "") or tab.get("filepath", ""))
-        if not target:
-            target = _first_window_untitled_cache_path()
-        try:
-            _save_as_mainfile_resilient("EXEC_DEFAULT", filepath=target, copy=False, check_existing=False)
-        except Exception:
-            pass
-        _set_active_in_registry(tab.get("filepath", "") or target)
         _sync_registry_to_properties(bpy.context)
     elif not data["tabs"]:
         _startup_session_initialized = False
@@ -2201,8 +2193,6 @@ def _ensure_startup_session():
         return 0.1
     _mark_process_session_registered(bpy.context)
     _request_view3d_redraw(bpy.context)
-    if startup_phase:
-        return min(0.2, max(0.01, _startup_session_deadline - time.monotonic()))
     _startup_session_deadline = 0.0
     return None
 
@@ -2583,7 +2573,7 @@ def _sync_registry_to_properties(context):
         tab.thumbnail_filepath = tab_data.get("thumbnail_filepath", "")
         tab.thumbnail_placeholder = bool(tab_data.get("thumbnail_placeholder", False))
         tab.title = tab_data["title"]
-        tab.is_active = (tab.tab_id == _live_group.tab_id) if _live_group else bool(tab_data["is_active"])
+        tab.is_active = _dock_tab_is_active(tab_data)
     _prune_selection(len(wm.mbb_bookmarks))
 
 
@@ -3711,10 +3701,10 @@ def _enable_live_group():
         return 0.25
     tab = _current_registry_tab()
     if not tab:
-        _ensure_startup_session()
+        retry = _ensure_startup_session()
         tab = _current_registry_tab()
-    if not tab:
-        return None
+        if not tab:
+            return retry
     try:
         overlay = _state_for_overlay_handoff(context=bpy.context)
         if not _is_resident_cache(tab.get("cache_filepath")) or _normalized_path(tab["cache_filepath"]) != _normalized_path(_current_blend_filepath()):
@@ -3777,6 +3767,8 @@ def _switch_live_tab(tab_id, load_ui=None, use_scripts=None, closing=None):
     tab = _live_tab(tab_id)
     if not tab or not _foreground_autosave_can_save():
         return {"CANCELLED"}
+    _set_single_selection(-1)
+    _tag_view3d_redraw()
     overlay = _remember_overlay_state(context=bpy.context)
     _pending_overlay_state = ""
     if tab_id == _live_group.tab_id:
@@ -3882,10 +3874,14 @@ def _close_live_tabs(ids):
     return _new_live_tab(bpy.context, closing=closing)
 
 
-def _finish_live_close(closing):
+def _record_live_close(closing):
     history = _live_group.read("closed").get("tabs", [])
     history.append(closing)
     _live_group.write("closed", {"tabs": history[-100:]})
+
+
+def _finish_live_close(closing):
+    _record_live_close(closing)
     for tab in closing:
         if _live_group.ready(tab["tab_id"])[1]:
             _live_group.write(f"close-{tab['tab_id']}", {"tab": tab})
@@ -3893,7 +3889,56 @@ def _finish_live_close(closing):
     ids = {tab["tab_id"] for tab in closing}
     _write_registry({"tabs": [tab for tab in data["tabs"] if tab["tab_id"] not in ids]})
     _sync_registry_to_properties(bpy.context)
-    _selected_bookmark_indices.clear()
+    _set_single_selection(-1)
+
+
+def _reconcile_live_exits(group):
+    tabs = _clean_registry(_read_registry())["tabs"]
+    active_id = group.read("active").get("tab_id", "")
+    exited = {}
+    process_exited = getattr(processes, "process_exited", None)
+    for tab in tabs:
+        tab_id = tab["tab_id"]
+        if tab_id == group.tab_id:
+            continue
+        marker = group.read(f"exited-{tab_id}")
+        pid = group.read(f"ready-{tab_id}").get("pid", 0)
+        if marker and not group.ready(tab_id)[1]:
+            exited[tab_id] = marker
+        elif not marker and pid and process_exited and process_exited(pid):
+            exited[tab_id] = marker
+    if not exited:
+        return
+
+    # The active survivor (or one deterministic fallback) owns the cleanup.
+    remaining = [tab for tab in tabs if tab["tab_id"] not in exited]
+    candidates = {tab["tab_id"] for tab in remaining if group.ready(tab["tab_id"])[1]}
+    if not candidates:
+        return
+    successor = active_id
+    if active_id not in candidates:
+        active_index = next((i for i, tab in enumerate(tabs) if tab["tab_id"] == active_id), -1)
+        fallback = _next_remaining_tab_after_close(
+            tabs, {i for i, tab in enumerate(tabs) if tab["tab_id"] not in candidates}, active_index,
+        )
+        successor = fallback["tab_id"]
+    if group.tab_id != successor:
+        return
+
+    _write_registry({"tabs": remaining})
+    _record_live_close([tab for tab in tabs if tab["tab_id"] in exited])
+    for tab_id in exited:
+        group.forget(f"ready-{tab_id}")
+        group.forget(f"exited-{tab_id}")
+    if active_id != successor:
+        state = exited.get(active_id, {}).get("state")
+        if state in OVERLAY_STATES:
+            group.write(f"overlay-handoff-{successor}", {"state": state})
+        group.write("active", {"tab_id": successor})
+        processes.focus(group.ready(successor)[1])
+    _set_single_selection(-1)
+    _sync_registry_to_properties(bpy.context)
+    _tag_view3d_redraw()
 
 
 def _restore_live_tabs(context):
@@ -4012,6 +4057,7 @@ def _live_tick():
             _add_live_tab(tab)
             group.reveal_all()
             print(f"Multi Files Bookmark: project was not closed: {exc}")
+    _reconcile_live_exits(group)
     handoff = group.read(f"overlay-handoff-{group.tab_id}").get("state")
     if handoff in OVERLAY_STATES:
         group.forget(f"overlay-handoff-{group.tab_id}")
@@ -4031,6 +4077,8 @@ def _live_tick():
         tabs = _clean_registry(_read_registry())["tabs"]
         if wm and list((item.tab_id, item.filepath, item.cache_filepath, item.thumbnail_filepath) for item in wm.mbb_bookmarks) != [
                 (tab["tab_id"], tab["filepath"], tab["cache_filepath"], tab["thumbnail_filepath"]) for tab in tabs]:
+            if [item.tab_id for item in wm.mbb_bookmarks] != [tab["tab_id"] for tab in tabs]:
+                _set_single_selection(-1)
             _sync_registry_to_properties(bpy.context)
             _tag_view3d_redraw()
         if mouse != _overlay_mouse_abs:
@@ -4049,7 +4097,7 @@ def _remove_live_recent_paths(paths, previous):
 
 
 def _bind_native_open_in_live_group():
-    global _pending_overlay_state
+    global _pending_overlay_state, _live_closing
     group = _live_group
     if not group or _live_booting or _live_binding:
         return None
@@ -4064,6 +4112,7 @@ def _bind_native_open_in_live_group():
         if _live_switch_ready(tab["tab_id"], _state_for_overlay_handoff(context=bpy.context)):
             # Do not bind this copy to a cache another instance owns.
             group.forget(f"ready-{group.tab_id}")
+            _live_closing = True
             bpy.ops.wm.quit_blender("EXEC_DEFAULT")
             return None
         # This native load already replaced the local scene; leave it as an
@@ -5802,7 +5851,8 @@ def _switch_bookmark_relative(context, direction):
     if current_index < 0:
         current_index = 0
     target_index = (current_index + direction) % count
-    _set_single_selection(target_index)
+    if not _live_group:
+        _set_single_selection(target_index)
     return bpy.ops.wm.mbb_open_bookmark(index=str(target_index))
 
 
@@ -5904,6 +5954,10 @@ def _draw_icon_button(x, y, size, hovered=False, active=True):
     _draw_frosted_panel(x, y, size, _scaled(TAB_HEIGHT), _scaled(12), active=active, hovered=hovered)
 
 
+def _dock_tab_is_active(tab):
+    return tab["tab_id"] == _live_group.tab_id if _live_group else bool(tab.get("is_active", False))
+
+
 def _draw_view3d_tab_bar():
     global _overlay_hitboxes, _overlay_last_region_size
 
@@ -5972,14 +6026,14 @@ def _draw_view3d_tab_bar():
     tooltip_tab = None
     tooltip_anchor = (0, 0)
     for index, tab in enumerate(tabs):
-        active = bool(tab.get("is_active", False))
+        active = _dock_tab_is_active(tab)
         selected = _is_bookmark_selected(index)
         hovered_tab = _is_hit_hovered("switch", index, area_id)
         hovered_close = _is_hit_hovered("close", index, area_id)
         if hovered_tab and not hovered_close:
             tooltip_tab = tab
             tooltip_anchor = (x + (12 * scale), y)
-        _draw_frosted_panel(x, y, tab_width, tab_height, (control_height * 0.5) if not thumb_mode else (18 * scale), active=active or selected, hovered=hovered_tab)
+        _draw_frosted_panel(x, y, tab_width, tab_height, (control_height * 0.5) if not thumb_mode else (18 * scale), active=active or (selected and not _live_group), hovered=hovered_tab)
         if selected:
             selected_outline = _dock_selected_color()
             _draw_rounded_rect_outline(x + (2 * scale), y + (2 * scale), tab_width - (4 * scale), tab_height - (4 * scale), (control_height * 0.5 - (2 * scale)) if not thumb_mode else (16 * scale), 1.4 * scale, selected_outline)
@@ -6237,12 +6291,22 @@ class MBB_OT_live_dock_click(bpy.types.Operator):
             if event.shift:
                 _select_bookmark_range(context, index)
             else:
-                _set_single_selection(index)
                 _defer_ui_action(lambda: bpy.ops.wm.mbb_open_bookmark(index=str(index)))
         elif action == "close":
             _defer_ui_action(lambda: bpy.ops.wm.mbb_remove_bookmark(index=str(index)))
         _tag_view3d_redraw(context)
         return {"FINISHED"}
+
+
+@persistent
+def _mbb_exit_pre(_dummy):
+    group = _live_group
+    if group and not (_live_closing or _live_booting):
+        try:
+            state = _state_for_overlay_handoff(context=bpy.context)
+            group.write(f"exited-{group.tab_id}", {"state": state})
+        except (OSError, RuntimeError) as exc:
+            print(f"Multi Files Bookmark: could not record native window close: {exc}")
 
 
 @persistent
@@ -6265,7 +6329,8 @@ def _mbb_load_pre(_dummy):
     _foreground_autosave_active_key = ""
     _persist_overlay_state(bpy.context)
     _remember_overlay_state(context=bpy.context)
-    _register_current_process_tab(is_active=False)
+    if _startup_session_initialized:
+        _register_current_process_tab(is_active=False)
     _sync_registry_to_properties(bpy.context)
 
 
@@ -6287,12 +6352,13 @@ def _mbb_load_post(_dummy):
             bpy.app.timers.register(_bind_native_open_in_live_group, first_interval=0.05)
         _schedule_overlay_router_restart()
         return
-    if time.monotonic() < _startup_session_deadline:
+    if not _startup_session_initialized:
         _ensure_startup_session()
     else:
         _register_current_process_tab(is_active=True)
         _sync_registry_to_properties(bpy.context)
     _start_foreground_autosave_timer()
+    _update_live_preference()
     _schedule_overlay_router_restart()
 
 
@@ -6691,6 +6757,9 @@ def register():
         bpy.app.handlers.save_post.append(_mbb_save_post)
     if _mbb_save_pre not in bpy.app.handlers.save_pre:
         bpy.app.handlers.save_pre.append(_mbb_save_pre)
+    exit_handlers = getattr(bpy.app.handlers, "exit_pre", None)
+    if exit_handlers is not None and _mbb_exit_pre not in exit_handlers:
+        exit_handlers.append(_mbb_exit_pre)
     if _live_group:
         if not _live_booting:
             bpy.app.timers.register(_resume_live_runtime, first_interval=0.1)
@@ -6698,7 +6767,7 @@ def register():
         _ensure_startup_session()
     else:
         try:
-            bpy.app.timers.register(_ensure_startup_session, first_interval=0.25)
+            bpy.app.timers.register(_ensure_startup_session, first_interval=0.25, persistent=True)
         except ValueError:
             pass
     if not bpy.app.background and not _live_group:
@@ -6743,6 +6812,9 @@ def unregister():
         bpy.app.handlers.save_post.remove(_mbb_save_post)
     if _mbb_save_pre in bpy.app.handlers.save_pre:
         bpy.app.handlers.save_pre.remove(_mbb_save_pre)
+    exit_handlers = getattr(bpy.app.handlers, "exit_pre", ())
+    if _mbb_exit_pre in exit_handlers:
+        exit_handlers.remove(_mbb_exit_pre)
 
     _unregister_keymaps()
 

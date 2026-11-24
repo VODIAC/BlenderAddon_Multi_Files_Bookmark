@@ -38,6 +38,16 @@ if SUPPORTED:
     _cursor = _api("GetCursorPos", wintypes.BOOL, ctypes.POINTER(wintypes.POINT))
     _client = _api("ScreenToClient", wintypes.BOOL, wintypes.HWND, ctypes.POINTER(wintypes.POINT))
     _client_rect = _api("GetClientRect", wintypes.BOOL, wintypes.HWND, ctypes.POINTER(wintypes.RECT))
+    _kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    _open_process = _kernel.OpenProcess
+    _open_process.restype = wintypes.HANDLE
+    _open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    _wait = _kernel.WaitForSingleObject
+    _wait.restype = wintypes.DWORD
+    _wait.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    _close_handle = _kernel.CloseHandle
+    _close_handle.restype = wintypes.BOOL
+    _close_handle.argtypes = (wintypes.HANDLE,)
 
 
 def owner_pid(hwnd):
@@ -50,6 +60,18 @@ def owner_pid(hwnd):
 
 def foreground_pid():
     return owner_pid(_foreground()) if SUPPORTED else 0
+
+
+def process_exited(pid):
+    if not SUPPORTED or not pid:
+        return False
+    handle = _open_process(0x00100000, False, pid)  # SYNCHRONIZE
+    if not handle:
+        return ctypes.get_last_error() == 87  # ERROR_INVALID_PARAMETER: no such PID
+    try:
+        return _wait(handle, 0) == 0  # WAIT_OBJECT_0
+    finally:
+        _close_handle(handle)
 
 
 def windows(pid):
@@ -194,6 +216,7 @@ class Group:
 
     def launch(self, binary, module, tab_id, job):
         self.forget(f"ready-{tab_id}")
+        self.forget(f"exited-{tab_id}")
         self.forget(f"result-{tab_id}")
         self.write(f"job-{tab_id}", job)
         env = dict(os.environ, **{ENV_GROUP: str(self.directory), ENV_TAB: tab_id})

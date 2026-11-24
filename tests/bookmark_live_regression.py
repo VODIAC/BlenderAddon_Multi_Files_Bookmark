@@ -1,5 +1,7 @@
 """Exercise the resident mode in an isolated interactive Blender instance."""
 
+import ctypes
+from ctypes import wintypes
 import os
 from pathlib import Path
 import shutil
@@ -67,6 +69,12 @@ def mark_autosave_edit(name):
     assert bpy.data.is_dirty
 
 
+def assert_single_active(group):
+    tabs = addon._clean_registry(addon._read_registry())["tabs"]
+    assert [tab["tab_id"] for tab in tabs if addon._dock_tab_is_active(tab)] == [group.tab_id]
+    assert [tab.tab_id for tab in bpy.context.window_manager.mbb_bookmarks if tab.is_active] == [group.tab_id]
+
+
 def run():
     try:
         now = time.monotonic()
@@ -129,6 +137,8 @@ def run():
             if addon.processes.foreground_pid() != os.getpid() or addon._live_group.read("active").get("tab_id") != state["source"]:
                 return 0.25
             assert bpy.data.filepath == state["working"]
+            assert_single_active(addon._live_group)
+            assert not addon._selected_bookmark_indices
             new_cache = root / "moved-cache"
             assert Path(prefs.cache_directory) == new_cache
             assert addon._registry_path() == state["registry"]
@@ -194,6 +204,22 @@ def run():
             assert (root / "a" / "Same.blend").is_file()
             assert (root / "b" / "Same.blend").is_file()
             advance("Ctrl+Shift+T path restored the closed project's cache in a fresh worker")
+        elif step == 8:
+            group = addon._live_group
+            restored = addon._find_tab_by_any_path(state["paths"][0])
+            if group.read("active").get("tab_id") != restored["tab_id"]:
+                return 0.25
+            group.write(f"test-{restored['tab_id']}", {"native_close": True})
+            advance("Requested native WM_CLOSE on the restored project's window")
+        elif step == 9:
+            group = addon._live_group
+            if addon._find_tab_by_any_path(state["paths"][0]):
+                return 0.25
+            active_id = group.read("active").get("tab_id")
+            assert active_id == state["b"]["tab_id"], active_id
+            assert addon.processes.any_visible(group.ready(active_id)[1])
+            assert group.read("closed")["tabs"][-1][0]["tab_id"] == state["a"]["tab_id"]
+            advance("Native close removed the tab, revealed its neighbor and recorded it for Reopen Closed")
         else:
             report("PASS")
             return None
@@ -228,7 +254,10 @@ def worker_step():
             assert bpy.data.filepath == working_path
             assert addon._registry_path() == registry_path
         if command.get("switch"):
+            assert_single_active(group)
+            addon._set_single_selection(0)
             assert addon._switch_live_tab(command["switch"]) == {"FINISHED"}
+            assert not addon._selected_bookmark_indices
         if command.get("save"):
             before = bpy.data.filepath
             a = root / "a" / "Same.blend"
@@ -243,6 +272,12 @@ def worker_step():
             assert addon._close_live_tabs({group.tab_id}) == {"FINISHED"}
         if command.get("restore"):
             assert addon._restore_live_tabs(bpy.context) == {"FINISHED"}
+        if command.get("native_close"):
+            assert_single_active(group)
+            bpy.context.preferences.view.use_save_prompt = False
+            post = ctypes.windll.user32.PostMessageW
+            post.argtypes = (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+            assert post(group.ready(group.tab_id)[1][0], 0x0010, 0, 0)  # WM_CLOSE
     except Exception:
         report(traceback.format_exc())
         return None
