@@ -203,9 +203,15 @@ KEYMAP_NAME = "Window"
 KEYMAP_SPACE_TYPE = "EMPTY"
 SHORTCUT_PRIORITY_LABEL = "Prioritize Add-on Shortcuts"
 SHORTCUT_PRIORITY_DESCRIPTION = (
-    "Give this add-on's shortcuts priority in conflicting editor keymaps "
-    "to reduce missed shortcuts caused by other bindings"
+    "Give this add-on priority over conflicting add-on and custom shortcuts. "
+    "Outside the dock, Blender's built-in shortcuts take precedence"
 )
+SHORTCUT_PRIORITY_WARNING = "Experimental: High risk. Not recommended. Enable only for debugging"
+SHORTCUT_MODIFIERS = ("shift", "ctrl", "alt", "oskey", "hyper")
+PROTECTED_MOUSE_KEYS = {"LEFTMOUSE", "MIDDLEMOUSE", "RIGHTMOUSE", "WHEELUPMOUSE", "WHEELDOWNMOUSE",
+                        "WHEELINMOUSE", "WHEELOUTMOUSE", "WHEELLEFTMOUSE", "WHEELRIGHTMOUSE",
+                        "TRACKPADPAN", "TRACKPADZOOM"}
+PROTECTED_SHORTCUT_KEYS = PROTECTED_MOUSE_KEYS | {"ESC", "RET", "NUMPAD_ENTER", "SPACE", "TAB", "BACK_SPACE", "DEL"}
 INTRO_TEXT = "Dock bar sits atop the 3D View and toggles via the bookmark icon or Toggle Bar shortcut."
 
 OVERLAY_STATES = {"HIDDEN", "NAMES", "THUMBNAILS"}
@@ -368,6 +374,8 @@ def _keymap_item_for_target(target, keyconfig=None):
         if km is None:
             continue
         for kmi in km.keymap_items:
+            if getattr(kmi.properties, "priority_copy", False):
+                continue
             if target == "shortcut_toggle_bar":
                 if kmi.idname == TOGGLE_BAR_SHORTCUT_OPERATOR_ID:
                     return kc, km, kmi
@@ -4362,9 +4370,13 @@ class MBB_OT_new_blend_bookmark(bpy.types.Operator):
 
     def execute(self, context):
         _remember_overlay_state(context=context)
-        if _live_group:
-            return _execute_or_defer(lambda: _new_live_tab(bpy.context))
-        return _execute_or_defer(lambda: (_create_untitled_bookmark(bpy.context, save_current=True), {"FINISHED"})[1])
+        return _create_bookmark_project()
+
+
+def _create_bookmark_project():
+    if _live_group:
+        return _execute_or_defer(lambda: _new_live_tab(bpy.context))
+    return _execute_or_defer(lambda: (_create_untitled_bookmark(bpy.context, save_current=True), {"FINISHED"})[1])
 
 
 class MBB_OT_save_original_project(bpy.types.Operator):
@@ -4373,6 +4385,7 @@ class MBB_OT_save_original_project(bpy.types.Operator):
     bl_description = "Save the current bookmark project to its original file location"
     bl_options = {"INTERNAL"}
 
+    priority_copy: BoolProperty(options={"HIDDEN", "SKIP_SAVE"})
     filepath: StringProperty(name="File Path", subtype="FILE_PATH")
     hide_props_region: BoolProperty(name="Hide Operator Properties", default=True, options={"HIDDEN"})
     check_existing: BoolProperty(name="Check Existing", default=True, options={"HIDDEN"})
@@ -4388,7 +4401,11 @@ class MBB_OT_save_original_project(bpy.types.Operator):
     def poll(cls, _context):
         return True
 
-    def invoke(self, context, _event):
+    def invoke(self, context, event):
+        _, _, binding = _keymap_item_for_target("shortcut_save_origin")
+        from_keymap = self.priority_copy or (binding and _keymap_item_matches_input(binding, event))
+        if from_keymap and not _allow_shortcut_event(context, event, "shortcut_save_origin", self.priority_copy):
+            return {"PASS_THROUGH"}
         self.compress = _default_file_compression()
         self.relative_remap = _default_relative_remap()
         current = _current_blend_filepath()
@@ -4730,6 +4747,16 @@ class MBB_OT_change_ui_color_menu(bpy.types.Operator):
         return context.window_manager.invoke_popup(self, width=165)
 
 
+class MBB_OT_shortcut_priority_warning(bpy.types.Operator):
+    bl_idname = "wm.mbb_shortcut_priority_warning"
+    bl_label = "Experimental"
+    bl_description = SHORTCUT_PRIORITY_WARNING
+    bl_options = {"INTERNAL"}
+
+    def execute(self, _context):
+        return {"FINISHED"}
+
+
 class MBB_OT_user_pref_menu(bpy.types.Operator):
     bl_idname = "wm.mbb_user_pref_menu"
     bl_label = "User Pref"
@@ -4753,7 +4780,9 @@ class MBB_OT_user_pref_menu(bpy.types.Operator):
         col = row.column(align=True)
         col.label(text=_t("Use Plugin Panel When Dropping Files Into Blender"))
         col.label(text=_t("to Support Multiple Files"))
-        layout.prop(prefs, "prioritize_shortcuts")
+        row = layout.row(align=True)
+        row.prop(prefs, "prioritize_shortcuts")
+        row.operator(MBB_OT_shortcut_priority_warning.bl_idname, text="", icon="ERROR", emboss=False)
 
     def draw_compact_prop(self, layout, prefs, prop_name, label):
         row = layout.row(align=True)
@@ -4918,9 +4947,16 @@ class MBB_OT_toggle_area_tab_bar(bpy.types.Operator):
     bl_description = "Show or hide the Multi Blender Bookmark floating tab bar for this 3D View"
     bl_options = {"INTERNAL"}
 
+    priority_copy: BoolProperty(options={"HIDDEN", "SKIP_SAVE"})
+
     @classmethod
     def poll(cls, _context):
         return True
+
+    def invoke(self, context, event):
+        if not _allow_shortcut_event(context, event, "shortcut_toggle_bar", self.priority_copy):
+            return {"PASS_THROUGH"}
+        return self.execute(context)
 
     def execute(self, context):
         area = getattr(context, "area", None)
@@ -5003,19 +5039,26 @@ class MBB_OT_dock_shortcut(bpy.types.Operator):
     bl_label = "Multi Files Bookmark Dock Shortcut"
     bl_options = {"INTERNAL"}
 
+    priority_copy: BoolProperty(options={"HIDDEN", "SKIP_SAVE"})
     target: EnumProperty(
         name="Dock Shortcut",
         items=tuple((target, SHORTCUT_TARGET_LABELS[target], "") for target in SHORTCUT_TARGETS),
     )
 
-    @classmethod
-    def poll(cls, _context):
-        return bpy.app.background or _shortcuts_are_global() or _mouse_over_any_dock()
+    def invoke(self, context, event):
+        if not _allow_shortcut_event(context, event, self.target, self.priority_copy):
+            return {"PASS_THROUGH"}
+        return self._run(context)
 
-    def execute(self, _context):
+    def execute(self, context):
+        if not (bpy.app.background or _shortcuts_are_global() or _mouse_over_any_dock()):
+            return {"CANCELLED"}
+        return self._run(context)
+
+    def _run(self, context):
         if self.target == "shortcut_new_file":
-            _remember_overlay_state(context=bpy.context)
-            return _execute_or_defer(lambda: bpy.ops.wm.mbb_new_blend())
+            _remember_overlay_state(context=context)
+            return _create_bookmark_project()
         if self.target == "shortcut_restore_closed":
             return _execute_or_defer(lambda: bpy.ops.wm.mbb_restore_closed_or_new())
         if self.target == "shortcut_close":
@@ -6463,6 +6506,7 @@ def _draw_header_tab_toggle(layout, context):
     area_id = _area_id(getattr(context, "area", None))
     active = bool(area_id and _is_overlay_enabled_for_area(context))
     row = layout.row(align=True)
+    row.operator_context = "EXEC_DEFAULT"
     row.operator(
         MBB_OT_toggle_area_tab_bar.bl_idname,
         text="",
@@ -6553,6 +6597,7 @@ classes = (
     MBB_OT_remove_ui_color_preset,
     MBB_OT_save_ui_color_preset,
     MBB_OT_change_ui_color_menu,
+    MBB_OT_shortcut_priority_warning,
     MBB_OT_user_pref_menu,
     MBB_OT_reset_ui_colors,
     MBB_OT_open_bookmark,
@@ -6592,12 +6637,168 @@ def _shortcut_event_signature(item):
     )
 
 
+def _may_match_without_modifiers(item):
+    return item.key_modifier == "NONE" and (
+        item.any or all(getattr(item, name, 0) in {0, -1} for name in SHORTCUT_MODIFIERS)
+    )
+
+
+def _event_is_over_dock(context, event):
+    area = context.area
+    region = context.region
+    if not area or area.type != "VIEW_3D" or not region or region.type != "WINDOW":
+        return False
+    area_id = _area_id(area)
+    rect = _overlay_dock_rects_by_area.get(area_id)
+    return bool(rect and _overlay_state_for_area(area, area_id) in VISIBLE_OVERLAY_STATES
+                and _point_in_rect(event.mouse_x, event.mouse_y, rect))
+
+
+_BUILTIN_KEYCONFIGS = {"Blender", "Blender_27x", "Industry_Compatible"}
+_VIEW3D_MODE_KEYMAPS = {
+    "Object Mode": {"OBJECT"}, "Mesh": {"EDIT_MESH"}, "Curve": {"EDIT_CURVE"},
+    "Curves": {"EDIT_CURVES"}, "Armature": {"EDIT_ARMATURE"}, "Metaball": {"EDIT_METABALL"},
+    "Lattice": {"EDIT_LATTICE"}, "Font": {"EDIT_TEXT"}, "Pose": {"POSE"},
+    "Vertex Paint": {"PAINT_VERTEX"}, "Weight Paint": {"PAINT_WEIGHT"},
+    "Image Paint": {"PAINT_TEXTURE"}, "Sculpt": {"SCULPT"}, "Sculpt Curves": {"SCULPT_CURVES"},
+    "Particle": {"PARTICLE"}, "Point Cloud": {"EDIT_POINT_CLOUD"},
+    "Paint Face Mask (Weight, Vertex, Texture)": {"PAINT_WEIGHT", "PAINT_VERTEX", "PAINT_TEXTURE"},
+    "Paint Vertex Selection (Weight, Vertex)": {"PAINT_WEIGHT", "PAINT_VERTEX"},
+}
+
+
+def _keymap_can_handle_event(keymap, context):
+    if keymap.is_modal:
+        return False
+    area = context.area
+    space = area.type if area else "EMPTY"
+    region = context.region.type if context.region else "WINDOW"
+    if keymap.space_type != "EMPTY":
+        if keymap.space_type != space or keymap.region_type != region:
+            return False
+        return True
+    if keymap.name in _VIEW3D_MODE_KEYMAPS:
+        if keymap.name == "Image Paint" and space == "IMAGE_EDITOR":
+            return region == "WINDOW" and area.spaces.active.mode == "PAINT"
+        return space == "VIEW_3D" and region == "WINDOW" and context.mode in _VIEW3D_MODE_KEYMAPS[keymap.name]
+    if keymap.name == "Object Non-modal" or keymap.name.startswith("Grease Pencil"):
+        return space == "VIEW_3D" and region == "WINDOW"
+    if keymap.name == "Animation Channels":
+        return region == "CHANNELS"
+    return True
+
+
+def _active_view3d_tool_keymaps(context):
+    if not context.area or context.area.type != "VIEW_3D" or not context.workspace:
+        return None
+    try:
+        from bl_ui.space_toolsystem_common import keymap_from_id
+
+        tool = context.workspace.tools.from_space_view3d_mode(context.mode, create=False)
+        if tool is None:
+            return None
+        names = set()
+        for tool_id in (tool.idname, tool.idname_fallback):
+            if tool_id:
+                name = keymap_from_id(context, "VIEW_3D", tool_id)
+                if isinstance(name, str) and name:
+                    names.update((name, name + " (fallback)"))
+    except (ImportError, AttributeError, RuntimeError, TypeError):
+        return None
+    return names or None
+
+
+def _keymap_item_matches_input(item, event):
+    if item.type not in {event.type, "ANY"}:
+        if item.type != "TEXTINPUT" or event.value != "PRESS" or not event.unicode:
+            return False
+    if item.value not in {"ANY", event.value}:
+        # Consuming a mouse press also prevents Blender's later click/drag dispatch.
+        if not (event.type.endswith("MOUSE") and event.value in {"PRESS", "RELEASE"}
+                and item.value in {"CLICK", "DOUBLE_CLICK", "CLICK_DRAG"}):
+            return False
+    if event.value == item.value == "CLICK_DRAG" and item.direction not in {"ANY", event.direction}:
+        return False
+    if getattr(event, "is_repeat", False) and not item.repeat:
+        return False
+    return item.any or all(getattr(item, name, 0) in {-1, int(bool(getattr(event, name, False)))}
+                           for name in SHORTCUT_MODIFIERS)
+
+
+def _has_native_shortcut(context, event):
+    configs = context.window_manager.keyconfigs
+    default, active, user = configs.default, configs.active, configs.user
+    if not default or not user:
+        return True
+    official = active and active.name in _BUILTIN_KEYCONFIGS
+    active_tool_maps = _active_view3d_tool_keymaps(context)
+    for keymap in user.keymaps:
+        if not _keymap_can_handle_event(keymap, context):
+            continue
+        if (active_tool_maps is not None and keymap.name.startswith("3D View Tool ")
+                and keymap.name not in active_tool_maps):
+            continue
+        location = {"space_type": keymap.space_type, "region_type": keymap.region_type}
+        original = active.keymaps.find(keymap.name, **location) if official else None
+        if original is None:
+            original = default.keymaps.find(keymap.name, **location)
+        if original is None:
+            continue
+        for source in original.keymap_items:
+            if not source.active or not _keymap_item_matches_input(source, event):
+                continue
+            # User diffs preserve native IDs when replacing entries; compare the chord as well.
+            effective = keymap.keymap_items.from_id(source.id) if official or active == default else None
+            signature = _shortcut_event_signature(source)
+            if not official and active != default:
+                # Imported presets may assign different IDs; changed chords are still custom.
+                effective = next((item for item in keymap.keymap_items if item.active
+                                  and item.idname == source.idname and _shortcut_event_signature(item) == signature), None)
+            if (not effective or not effective.active or effective.idname != source.idname
+                    or _shortcut_event_signature(effective) != signature):
+                continue
+            module, _, operator = source.idname.partition(".")
+            try:
+                if getattr(getattr(bpy.ops, module), operator).poll():
+                    return True
+            except (AttributeError, RuntimeError):
+                continue
+    return False
+
+
+def _allow_shortcut_event(context, event, target, priority_copy):
+    prefs = _addon_preferences()
+    priority = bool(prefs and prefs.prioritize_shortcuts)
+    if priority_copy and not priority:
+        return False
+    over_dock = _event_is_over_dock(context, event)
+    if target in SHORTCUT_TARGETS and not over_dock and not _shortcuts_are_global():
+        return False
+    if over_dock and event.type == "LEFTMOUSE" and _hitbox_at(
+        event.mouse_x, event.mouse_y, _overlay_hitboxes_by_area.get(_area_id(context.area), ())
+    ):
+        return False
+    if event.type in PROTECTED_SHORTCUT_KEYS:
+        bare = not any(getattr(event, name, False) for name in SHORTCUT_MODIFIERS)
+        if bare:
+            _, _, item = _keymap_item_for_target(target)
+            if (item is None or _may_match_without_modifiers(item)) and (
+                priority_copy or (priority and not over_dock) or event.type in PROTECTED_MOUSE_KEYS
+            ):
+                return False
+    if not over_dock and priority:
+        if context.area and context.area.type in {"FILE_BROWSER", "PREFERENCES"}:
+            return False
+        return not _has_native_shortcut(context, event)
+    return True
+
+
 def _conflicts_with_shortcut(item, shortcut):
     if item.key_modifier != shortcut.key_modifier:
         return False
     if item.any or shortcut.any:
         return True
-    for modifier in ("shift", "ctrl", "alt", "oskey", "hyper"):
+    for modifier in SHORTCUT_MODIFIERS:
         lhs, rhs = getattr(item, modifier, 0), getattr(shortcut, modifier, 0)
         if lhs != rhs and lhs != -1 and rhs != -1:
             return False
@@ -6616,13 +6817,14 @@ def _sync_priority_keymaps():
     shortcuts_by_type = {}
     for target in SHORTCUT_TARGET_LABELS:
         _, _, item = _keymap_item_for_target(target, user)
-        if item is not None and item.active:
+        if (item is not None and item.active
+                and not (item.type in PROTECTED_SHORTCUT_KEYS and _may_match_without_modifiers(item))):
             shortcuts_by_type.setdefault(item.type, []).append((target, item))
 
     desired = {}
     our_operators = {DOCK_SHORTCUT_OPERATOR_ID, TOGGLE_BAR_SHORTCUT_OPERATOR_ID, SAVE_ORIGINAL_OPERATOR_ID}
     for km in user.keymaps:
-        if km.name == KEYMAP_NAME or km.is_modal or km.space_type in {"FILE_BROWSER", "PREFERENCES"}:
+        if km.is_modal or km.space_type in {"FILE_BROWSER", "PREFERENCES"}:
             continue
         for item in km.keymap_items:
             if not item.active or item.idname in our_operators:
@@ -6642,7 +6844,9 @@ def _sync_priority_keymaps():
             name, space_type, region_type, _, _ = key
             km = kc.keymaps.new(name=name, space_type=space_type, region_type=region_type)
             # Blender prepends add-on items when it merges them into the user keymap.
-            _priority_keymaps[key] = (km, km.keymap_items.new_from_item(desired[key]))
+            item = km.keymap_items.new_from_item(desired[key])
+            item.properties.priority_copy = True
+            _priority_keymaps[key] = (km, item)
     if removed or added:
         configs.update()
 
