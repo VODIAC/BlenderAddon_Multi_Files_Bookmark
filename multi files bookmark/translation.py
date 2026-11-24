@@ -60,7 +60,7 @@ ZH_CN = {
     ("*", "Edit bookmark user preferences"): "修改书签用户偏好",
     ("*", "Keymap Scope"): "快捷键生效范围",
     ("*", "Prioritize Add-on Shortcuts"): "优先生效本插件的快捷键",
-    ("*", "Give this add-on priority over conflicting add-on and custom shortcuts. Outside the dock, Blender's built-in shortcuts take precedence"): "快捷键冲突时，本插件优先于其他插件和自定义绑定；在书签栏外，Blender 原生快捷键优先。",
+    ("*", "When shortcuts conflict, this add-on's configured shortcuts take priority. Essential inputs such as the left mouse button are not overridden, so basic controls still work"): "快捷键冲突时，插件内设置的快捷键优先执行。鼠标左键等重要键位不会被覆盖，以免影响基础操作",
     ("*", "Experimental"): "实验性功能",
     ("*", "Experimental: High risk. Not recommended. Enable only for debugging"): "实验性功能：高风险，不建议开启，仅用于调试。",
     ("*", "Choose whether bookmark shortcuts work everywhere or only while the mouse is over the dock"): "选择书签快捷键全局生效或仅在鼠标位于面板内时生效",

@@ -203,8 +203,8 @@ KEYMAP_NAME = "Window"
 KEYMAP_SPACE_TYPE = "EMPTY"
 SHORTCUT_PRIORITY_LABEL = "Prioritize Add-on Shortcuts"
 SHORTCUT_PRIORITY_DESCRIPTION = (
-    "Give this add-on priority over conflicting add-on and custom shortcuts. "
-    "Outside the dock, Blender's built-in shortcuts take precedence"
+    "When shortcuts conflict, this add-on's configured shortcuts take priority. "
+    "Essential inputs such as the left mouse button are not overridden, so basic controls still work"
 )
 SHORTCUT_PRIORITY_WARNING = "Experimental: High risk. Not recommended. Enable only for debugging"
 SHORTCUT_MODIFIERS = ("shift", "ctrl", "alt", "oskey", "hyper")
@@ -6654,60 +6654,6 @@ def _event_is_over_dock(context, event):
                 and _point_in_rect(event.mouse_x, event.mouse_y, rect))
 
 
-_BUILTIN_KEYCONFIGS = {"Blender", "Blender_27x", "Industry_Compatible"}
-_VIEW3D_MODE_KEYMAPS = {
-    "Object Mode": {"OBJECT"}, "Mesh": {"EDIT_MESH"}, "Curve": {"EDIT_CURVE"},
-    "Curves": {"EDIT_CURVES"}, "Armature": {"EDIT_ARMATURE"}, "Metaball": {"EDIT_METABALL"},
-    "Lattice": {"EDIT_LATTICE"}, "Font": {"EDIT_TEXT"}, "Pose": {"POSE"},
-    "Vertex Paint": {"PAINT_VERTEX"}, "Weight Paint": {"PAINT_WEIGHT"},
-    "Image Paint": {"PAINT_TEXTURE"}, "Sculpt": {"SCULPT"}, "Sculpt Curves": {"SCULPT_CURVES"},
-    "Particle": {"PARTICLE"}, "Point Cloud": {"EDIT_POINT_CLOUD"},
-    "Paint Face Mask (Weight, Vertex, Texture)": {"PAINT_WEIGHT", "PAINT_VERTEX", "PAINT_TEXTURE"},
-    "Paint Vertex Selection (Weight, Vertex)": {"PAINT_WEIGHT", "PAINT_VERTEX"},
-}
-
-
-def _keymap_can_handle_event(keymap, context):
-    if keymap.is_modal:
-        return False
-    area = context.area
-    space = area.type if area else "EMPTY"
-    region = context.region.type if context.region else "WINDOW"
-    if keymap.space_type != "EMPTY":
-        if keymap.space_type != space or keymap.region_type != region:
-            return False
-        return True
-    if keymap.name in _VIEW3D_MODE_KEYMAPS:
-        if keymap.name == "Image Paint" and space == "IMAGE_EDITOR":
-            return region == "WINDOW" and area.spaces.active.mode == "PAINT"
-        return space == "VIEW_3D" and region == "WINDOW" and context.mode in _VIEW3D_MODE_KEYMAPS[keymap.name]
-    if keymap.name == "Object Non-modal" or keymap.name.startswith("Grease Pencil"):
-        return space == "VIEW_3D" and region == "WINDOW"
-    if keymap.name == "Animation Channels":
-        return region == "CHANNELS"
-    return True
-
-
-def _active_view3d_tool_keymaps(context):
-    if not context.area or context.area.type != "VIEW_3D" or not context.workspace:
-        return None
-    try:
-        from bl_ui.space_toolsystem_common import keymap_from_id
-
-        tool = context.workspace.tools.from_space_view3d_mode(context.mode, create=False)
-        if tool is None:
-            return None
-        names = set()
-        for tool_id in (tool.idname, tool.idname_fallback):
-            if tool_id:
-                name = keymap_from_id(context, "VIEW_3D", tool_id)
-                if isinstance(name, str) and name:
-                    names.update((name, name + " (fallback)"))
-    except (ImportError, AttributeError, RuntimeError, TypeError):
-        return None
-    return names or None
-
-
 def _keymap_item_matches_input(item, event):
     if item.type not in {event.type, "ANY"}:
         if item.type != "TEXTINPUT" or event.value != "PRESS" or not event.unicode:
@@ -6723,47 +6669,6 @@ def _keymap_item_matches_input(item, event):
         return False
     return item.any or all(getattr(item, name, 0) in {-1, int(bool(getattr(event, name, False)))}
                            for name in SHORTCUT_MODIFIERS)
-
-
-def _has_native_shortcut(context, event):
-    configs = context.window_manager.keyconfigs
-    default, active, user = configs.default, configs.active, configs.user
-    if not default or not user:
-        return True
-    official = active and active.name in _BUILTIN_KEYCONFIGS
-    active_tool_maps = _active_view3d_tool_keymaps(context)
-    for keymap in user.keymaps:
-        if not _keymap_can_handle_event(keymap, context):
-            continue
-        if (active_tool_maps is not None and keymap.name.startswith("3D View Tool ")
-                and keymap.name not in active_tool_maps):
-            continue
-        location = {"space_type": keymap.space_type, "region_type": keymap.region_type}
-        original = active.keymaps.find(keymap.name, **location) if official else None
-        if original is None:
-            original = default.keymaps.find(keymap.name, **location)
-        if original is None:
-            continue
-        for source in original.keymap_items:
-            if not source.active or not _keymap_item_matches_input(source, event):
-                continue
-            # User diffs preserve native IDs when replacing entries; compare the chord as well.
-            effective = keymap.keymap_items.from_id(source.id) if official or active == default else None
-            signature = _shortcut_event_signature(source)
-            if not official and active != default:
-                # Imported presets may assign different IDs; changed chords are still custom.
-                effective = next((item for item in keymap.keymap_items if item.active
-                                  and item.idname == source.idname and _shortcut_event_signature(item) == signature), None)
-            if (not effective or not effective.active or effective.idname != source.idname
-                    or _shortcut_event_signature(effective) != signature):
-                continue
-            module, _, operator = source.idname.partition(".")
-            try:
-                if getattr(getattr(bpy.ops, module), operator).poll():
-                    return True
-            except (AttributeError, RuntimeError):
-                continue
-    return False
 
 
 def _allow_shortcut_event(context, event, target, priority_copy):
@@ -6783,13 +6688,9 @@ def _allow_shortcut_event(context, event, target, priority_copy):
         if bare:
             _, _, item = _keymap_item_for_target(target)
             if (item is None or _may_match_without_modifiers(item)) and (
-                priority_copy or (priority and not over_dock) or event.type in PROTECTED_MOUSE_KEYS
+                priority or event.type in PROTECTED_MOUSE_KEYS
             ):
                 return False
-    if not over_dock and priority:
-        if context.area and context.area.type in {"FILE_BROWSER", "PREFERENCES"}:
-            return False
-        return not _has_native_shortcut(context, event)
     return True
 
 
@@ -6824,7 +6725,7 @@ def _sync_priority_keymaps():
     desired = {}
     our_operators = {DOCK_SHORTCUT_OPERATOR_ID, TOGGLE_BAR_SHORTCUT_OPERATOR_ID, SAVE_ORIGINAL_OPERATOR_ID}
     for km in user.keymaps:
-        if km.is_modal or km.space_type in {"FILE_BROWSER", "PREFERENCES"}:
+        if km.is_modal:
             continue
         for item in km.keymap_items:
             if not item.active or item.idname in our_operators:

@@ -45,9 +45,11 @@ def checks():
     assert prefs.prioritize_shortcuts is False
     addon._switch_bookmark_relative = lambda _context, delta: calls.append(delta) or {"FINISHED"}
     assert bindings("3D View", "BUTTON4MOUSE")[0] == "view3d.view_selected"
+    area.spaces.active.region_3d.view_distance = 50
     simulate()
     yield 0.3
     assert calls == [], calls
+    assert area.spaces.active.region_3d.view_distance < 50
 
     prefs.prioritize_shortcuts = True
     yield 1.0
@@ -55,21 +57,9 @@ def checks():
     area.spaces.active.region_3d.view_distance = 50
     simulate()
     yield 0.3
-    assert calls == [], calls
-    assert area.spaces.active.region_3d.view_distance < 50
-
-    native = next(i for i in configs.user.keymaps["3D View"].keymap_items
-                  if i.idname == "view3d.view_selected" and i.type == "BUTTON4MOUSE")
-    native.active = False
-    configs.update()
-    simulate()
-    yield 0.3
-    assert calls.pop() == -1 and not calls
-    native = next(i for i in configs.user.keymaps["3D View"].keymap_items
-                  if i.idname == "view3d.view_selected" and i.type == "BUTTON4MOUSE")
-    native.active = True
-    configs.update()
-    yield 1.0
+    assert calls == [-1], calls
+    assert area.spaces.active.region_3d.view_distance == 50
+    calls.clear()
 
     with bpy.context.temp_override(window=window, area=area, region=region):
         bpy.ops.wm.mbb_set_view_mode(mode="NAMES")
@@ -82,9 +72,11 @@ def checks():
 
     prefs.shortcut_scope = "PANEL"
     addon._overlay_mouse_abs = (-100000, -100000)
+    area.spaces.active.region_3d.view_distance = 50
     simulate()
     yield 0.3
     assert calls == [-1], calls
+    assert area.spaces.active.region_3d.view_distance < 50
     prefs.shortcut_scope = "GLOBAL"
 
     _, _, original = addon._keymap_item_for_target("shortcut_prev", configs.user)
@@ -144,11 +136,22 @@ def checks():
     _, _, original = addon._keymap_item_for_target("shortcut_prev", configs.user)
     original.map_type = "KEYBOARD"
     original.type = "SPACE"
+    original.ctrl = 0
+    configs.update()
+    yield 1.0
+    assert not any(item.type == "SPACE" for _, item in addon._priority_keymaps.values())
+    assert not addon._allow_shortcut_event(
+        bpy.context, SimpleNamespace(type="SPACE"), "shortcut_prev", False
+    )
+    _, _, original = addon._keymap_item_for_target("shortcut_prev", configs.user)
     original.ctrl = 1
     configs.user.keymaps["3D View"].keymap_items.new("view3d.view_selected", "SPACE", "PRESS", ctrl=True)
     configs.update()
     yield 1.0
     assert any(item.type == "SPACE" for _, item in addon._priority_keymaps.values())
+    simulate("SPACE", ctrl=True)
+    yield 0.3
+    assert calls.pop() == -1 and calls == [-1, -1], calls
     x, y, w, h = addon._overlay_dock_rects_by_area[area_id]
     simulate("SPACE", int(x + w / 2), int(y + h / 2), ctrl=True)
     yield 0.3
@@ -189,6 +192,8 @@ def checks():
         label = bpy.app.translations.pgettext_iface(addon.SHORTCUT_PRIORITY_LABEL)
         warning = bpy.app.translations.pgettext_tip(addon.MBB_OT_shortcut_priority_warning.bl_description)
         assert (tip == description) == (lang == "en_US"), (lang, tip)
+        if lang == "zh_HANS":
+            assert tip == "快捷键冲突时，插件内设置的快捷键优先执行。鼠标左键等重要键位不会被覆盖，以免影响基础操作", tip
         assert (label == addon.SHORTCUT_PRIORITY_LABEL) == (lang == "en_US"), (lang, label)
         assert (warning == addon.SHORTCUT_PRIORITY_WARNING) == (lang == "en_US"), (lang, warning)
 
