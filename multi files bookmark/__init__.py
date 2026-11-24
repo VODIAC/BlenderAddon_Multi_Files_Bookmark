@@ -4768,11 +4768,11 @@ class MBB_OT_user_pref_menu(bpy.types.Operator):
         if not prefs:
             return
         layout = self.layout
+        self.draw_compact_prop(layout, prefs, "shortcut_scope", _t("Keymap Scope"))
+        self.draw_compact_prop(layout, prefs, "cache_directory", _t("Cache Folder"))
         live_row = layout.row()
         live_row.enabled = processes.SUPPORTED
         live_row.prop(prefs, "use_live_projects", text=_t(LIVE_MODE_LABEL))
-        self.draw_compact_prop(layout, prefs, "shortcut_scope", _t("Keymap Scope"))
-        self.draw_compact_prop(layout, prefs, "cache_directory", _t("Cache Folder"))
         layout.prop(prefs, "show_hover_full_name", text=_t("Show Full Name on Hover"))
         layout.prop(prefs, "show_hover_file_path", text=_t("Show File Path on Hover"))
         row = layout.row(align=True)
