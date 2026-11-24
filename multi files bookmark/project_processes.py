@@ -142,8 +142,6 @@ class Group:
         self.directory = Path(directory)
         self.tab_id = tab_id
         self.config = self.read("group")
-        self.cache_settings = {"directory": self.config.get("cache", ""), "previous": []}
-        self.refresh_cache_settings()
         self.children = {}
 
     @classmethod
@@ -167,12 +165,6 @@ class Group:
     def rebind(self, tab_id):
         self.tab_id = tab_id
         os.environ[ENV_TAB] = tab_id
-
-    def refresh_cache_settings(self):
-        settings = self.read("cache-settings")
-        if settings.get("directory"):
-            self.cache_settings = settings
-        return self.cache_settings
 
     def read(self, name):
         return read(self.directory / f"{name}.json")

@@ -410,7 +410,7 @@ def _mark_process_session_registered(context=None):
 
 def _cache_dir():
     if _live_group:
-        return _live_group.cache_settings["directory"]
+        return _live_cache_settings(_live_group)["directory"]
     prefs = _addon_preferences()
     if prefs and hasattr(prefs, "cache_directory") and prefs.cache_directory:
         path = bpy.path.abspath(prefs.cache_directory)
@@ -431,7 +431,7 @@ def _cache_dir():
 
 
 def _previous_cache_directories():
-    settings = _live_group.cache_settings if _live_group else _saved_cache_settings
+    settings = _live_cache_settings(_live_group) if _live_group else _saved_cache_settings
     return settings.get("previous", ())
 
 
@@ -1384,7 +1384,7 @@ def _update_cache_directory(self, _context=None):
     new_dir = bpy.path.abspath(getattr(self, "cache_directory", "") or DEFAULT_CACHE_DIR)
     if _live_group:
         group = _live_group
-        settings = group.refresh_cache_settings()
+        settings = _live_cache_settings(group, refresh=True)
         old_dir = settings["directory"]
         new_dir = os.path.abspath(new_dir)
         if _normalized_path(old_dir) == _normalized_path(new_dir):
@@ -1445,8 +1445,21 @@ def _set_cache_preference(prefs, directory):
 
 
 def _sync_live_cache_preference(prefs=None):
-    directory = _live_group.refresh_cache_settings()["directory"]
+    directory = _live_cache_settings(_live_group, refresh=True)["directory"]
     _set_cache_preference(prefs or _addon_preferences(), directory)
+
+
+def _live_cache_settings(group, refresh=False):
+    # Blender can reload this module while retaining an older Group class.
+    settings = getattr(group, "cache_settings", None)
+    if refresh or not settings:
+        shared = group.read("cache-settings")
+        if shared.get("directory"):
+            settings = shared
+    if not settings:
+        settings = {"directory": group.config.get("cache") or DEFAULT_CACHE_DIR, "previous": []}
+    group.cache_settings = settings
+    return settings
 
 
 def _request_view3d_redraw(context=None):
@@ -3260,10 +3273,10 @@ def _theme_source_menu_text(text):
     return _t(str(text or ""))
 
 
-def _theme_source_label(path):
+def _theme_source_label(path, translate=_theme_source_menu_text):
     labels = _theme_color_entry_labels.get(path)
     if labels:
-        return " > ".join(_theme_source_menu_text(label) for label in labels)
+        return " > ".join(translate(label) for label in labels)
     return str(path or "")
 
 
@@ -4218,8 +4231,8 @@ class MBB_OT_open_blend_bookmark(bpy.types.Operator):
     filter_backup: BoolProperty(name="Filter backup .blend files", default=False, options={"HIDDEN"})
     filter_folder: BoolProperty(name="Filter folders", default=True, options={"HIDDEN"})
     filemode: IntProperty(name="File Browser Mode", default=8, options={"HIDDEN"})
-    load_ui: BoolProperty(name="Load UI", default=True)
-    use_scripts: BoolProperty(name="Trusted Source", default=False)
+    load_ui: BoolProperty(name="Load UI", description="Load the user interface setup saved in the project", default=True)
+    use_scripts: BoolProperty(name="Trusted Source", description="Allow Python scripts in the selected project to run automatically", default=False)
     display_file_selector: BoolProperty(name="Display File Selector", default=True, options={"HIDDEN"})
     opened_from_file_selector: BoolProperty(default=False, options={"HIDDEN"})
     filter_glob: StringProperty(default="*.blend", options={"HIDDEN"})
@@ -4293,8 +4306,8 @@ class MBB_OT_save_original_project(bpy.types.Operator):
     filter_backup: BoolProperty(name="Filter backup .blend files", default=False, options={"HIDDEN"})
     filter_folder: BoolProperty(name="Filter folders", default=True, options={"HIDDEN"})
     filemode: IntProperty(name="File Browser Mode", default=8, options={"HIDDEN"})
-    compress: BoolProperty(name="Compress", default=False)
-    relative_remap: BoolProperty(name="Remap Relative", default=True)
+    compress: BoolProperty(name="Compress", description="Compress the saved Blender file", default=False)
+    relative_remap: BoolProperty(name="Remap Relative", description="Adjust relative paths so they still point to the same files after saving to a new location", default=True)
     filter_glob: StringProperty(default="*.blend", options={"HIDDEN"})
 
     @classmethod
@@ -4409,7 +4422,7 @@ class MBB_OT_set_theme_color_source(bpy.types.Operator):
     @classmethod
     def description(cls, _context, properties):
         _preview_theme_color(getattr(properties, "target", ""), getattr(properties, "source_path", ""))
-        return _theme_source_label(getattr(properties, "source_path", ""))
+        return _theme_source_label(getattr(properties, "source_path", ""), bpy.app.translations.pgettext_tip)
 
     def execute(self, context):
         prefs = _addon_preferences()
@@ -4511,7 +4524,7 @@ class MBB_OT_add_ui_color_preset(bpy.types.Operator):
     bl_description = "Save current plugin UI colors as a new preset"
     bl_options = {"INTERNAL"}
 
-    name: StringProperty(name="Name", default="")
+    name: StringProperty(name="Name", description="Name of the new plugin UI color preset", default="")
 
     def draw(self, _context):
         self.layout.prop(self, "name", text="Name")
@@ -4658,11 +4671,7 @@ class MBB_OT_user_pref_menu(bpy.types.Operator):
         live_row.enabled = processes.SUPPORTED
         live_row.prop(prefs, "use_live_projects", text=_t(LIVE_MODE_LABEL))
         self.draw_compact_prop(layout, prefs, "shortcut_scope", _t("Keymap Scope"))
-        cache_row = layout.column(align=True)
-        self.draw_compact_prop(cache_row, prefs, "cache_directory", _t("Cache Folder"))
-        if _live_group:
-            cache_row.label(text=_t("New caches and previews use this folder."))
-            cache_row.label(text=_t("Open projects keep their working files."))
+        self.draw_compact_prop(layout, prefs, "cache_directory", _t("Cache Folder"))
         layout.prop(prefs, "show_hover_full_name", text=_t("Show Full Name on Hover"))
         layout.prop(prefs, "show_hover_file_path", text=_t("Show File Path on Hover"))
         row = layout.row(align=True)

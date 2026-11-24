@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import time
@@ -45,7 +46,7 @@ if not is_worker:
     bpy.context.preferences.filepaths.auto_save_time = 1
     bpy.context.preferences.edit.use_global_undo = True
     bpy.context.preferences.view.show_splash = False
-state = {"step": 0, "started": time.monotonic(), "pids": []}
+state = {"step": 0, "started": time.monotonic(), "pids": [], "foreground": {}, "last_sample": None}
 
 
 def report(message):
@@ -59,8 +60,21 @@ def advance(message):
     state["started"] = time.monotonic()
 
 
+def mark_autosave_edit(name):
+    bpy.context.scene["mbb_autosave_test"] = name
+    # Updating a custom property from Python alone does not mark the file dirty.
+    assert bpy.ops.ed.undo_push(message="Autosave test edit") == {"FINISHED"}
+    assert bpy.data.is_dirty
+
+
 def run():
     try:
+        now = time.monotonic()
+        sample = state["last_sample"]
+        if sample:
+            previous_time, previous_pid = sample
+            state["foreground"][previous_pid] = state["foreground"].get(previous_pid, 0) + now - previous_time
+        state["last_sample"] = (now, addon.processes.foreground_pid())
         step = state["step"]
         assert time.monotonic() - state["started"] < 100, f"Timeout at step {step}"
         if step == 0:
@@ -104,6 +118,7 @@ def run():
                 raise AssertionError(group.read(f"result-{tab['tab_id']}"))
             state["pids"].append(pid)
             state["b"] = tab
+            state["b_pid"] = pid
             assert Path(tab["cache_filepath"]).is_file()
             assert addon.processes.foreground_pid() == pid
             assert not addon.processes.any_visible(addon.processes.windows(os.getpid()))
@@ -128,6 +143,7 @@ def run():
             assert bpy.context.scene["mbb_live_test"] == 7
             assert bpy.ops.ed.undo() == {"FINISHED"}
             assert bpy.context.scene["mbb_live_test"] == 3
+            mark_autosave_edit("root")
             tab = addon._find_tab_by_any_path(state["paths"][0])
             assert addon._switch_live_tab(tab["tab_id"], load_ui=False) == {"FINISHED"}
             advance("The original project retained both native Undo and Redo without a reload")
@@ -143,9 +159,24 @@ def run():
             assert tab["cache_filepath"] != state["b"]["cache_filepath"]
             assert Path(tab["cache_filepath"]).parent == root / "moved-cache"
             assert addon.processes.foreground_pid() == pid
-            group.write(f"test-{tab['tab_id']}", {"save": True, "close": True})
+            state["a_pid"] = pid
             advance("Both same-name projects use different working caches, including Load UI off")
         elif step == 5:
+            ids = {"root": os.getpid(), "a": state["a_pid"], "b": state["b_pid"]}
+            assert len(set(ids.values())) == 3
+            assert addon.processes.foreground_pid() == ids["a"], "Keep the isolated test worker in front until autosave is verified"
+            snapshots = {name: list((root / "autosave").glob(f"*_{pid}_autosave.blend")) for name, pid in ids.items()}
+            if not all(snapshots.values()):
+                return 0.25
+            for name, files in snapshots.items():
+                assert len(files) == 1, (name, files)
+                shutil.copy2(files[0], root / f"recovery-{name}.blend")
+            for name in ("root", "b"):
+                assert state["foreground"].get(ids[name], 0) < 60, state["foreground"]
+            foreground = {name: round(state["foreground"].get(pid, 0), 2) for name, pid in ids.items()}
+            advance(f"All three native autosaves found; foreground seconds: {foreground}")
+            addon._live_group.write(f"test-{state['a']['tab_id']}", {"save": True, "close": True})
+        elif step == 6:
             group = addon._live_group
             tab_id = group.read("active").get("tab_id")
             if addon._find_tab_by_any_path(state["paths"][0]) or tab_id == state["source"]:
@@ -154,7 +185,7 @@ def run():
                 return 0.25
             group.write(f"test-{tab_id}", {"restore": True})
             advance("Manual Save to Origin and close requested in the foreground worker")
-        elif step == 6:
+        elif step == 7:
             group = addon._live_group
             restored = addon._find_tab_by_any_path(state["paths"][0])
             if restored is None or not group.ready(restored["tab_id"])[1]:
@@ -163,11 +194,6 @@ def run():
             assert (root / "a" / "Same.blend").is_file()
             assert (root / "b" / "Same.blend").is_file()
             advance("Ctrl+Shift+T path restored the closed project's cache in a fresh worker")
-        elif step == 7:
-            pid = os.getpid()
-            if not list(Path(bpy.context.preferences.filepaths.temporary_directory).glob(f"*_{pid}_autosave.blend")):
-                return 1.0
-            advance("Hidden project wrote a native Blender autosave without the plugin timer")
         else:
             report("PASS")
             return None
@@ -181,6 +207,9 @@ def run():
 def worker_step():
     try:
         group = addon._live_group
+        if "mbb_autosave_test" not in bpy.context.scene:
+            assert not bpy.app.timers.is_registered(addon._foreground_autosave_timer)
+            mark_autosave_edit(Path(addon._live_tab(group.tab_id)["filepath"]).parent.name)
         message = f"test-{group.tab_id}"
         command = group.read(message)
         if not command:
